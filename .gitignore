@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# patient data must never be committed (secure environment)
+*.parquet
