@@ -1,22 +1,25 @@
-"""Preprocessing-correctness gate for the honic (German cohort) dataframes.
+# %%
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG  —  edit these, then run the cells below top-to-bottom.
+#
+# honic preprocessing-correctness gate: validates the two preprocessed parquet
+# files the honic reader will consume before a *pretrained* Delphi model is run:
+#     df_meta.parquet  : one row/patient  -> patient_id, age_bl, gender_bl, region_bl
+#     df_event.parquet : the event stream -> patient_id, value, age, idx
+# `idx` is the Delphi token id, `value` its short label; both must be consistent
+# with the pretrained label index CSV (labels_short=name, index/token=id).
+# ─────────────────────────────────────────────────────────────────────────────
 
-Validates the two preprocessed parquet files the honic reader will consume before
-a *pretrained* Delphi model is evaluated on them:
+DATA_DIR = "."                                  # folder holding df_meta.parquet + df_event.parquet
+LABELS_PATH = "delphi_labels_index_name.csv"    # pretrained Delphi label index CSV
 
-    df_meta.parquet  : one row per patient  -> patient_id, age_bl, gender_bl, region_bl
-    df_event.parquet : the full event stream -> patient_id, value, age, idx
 
-`idx` is the integer Delphi token id and `value` its short label; both must be
-consistent with the pretrained label index (delphi_labels_index_name.csv, where
-`labels_short` = name and `index`/`token` = id). Token semantics come from that
-file's `type` column: covars (padding/no_event/sex/lifestyle), icdcodes (disease),
-death.
-
-Ages here are in YEARS. The model consumes DAYS, so the honic reader must apply the
-x365.25 conversion; that (and patient_id id-mapping) is the reader's job, not this
-gate's. Each assert below guards an invariant the delphi reader/model/eval relies on
-and that would silently corrupt results if violated -- see the inline notes.
-"""
+# %%
+# ── Setup: imports, constants, and the checks ────────────────────────────────
+# Ages here are in YEARS. The model consumes DAYS, so the honic reader must apply
+# the x365.25 conversion; that (and patient_id id-mapping) is the reader's job,
+# not this gate's. Each assert guards an invariant the delphi reader/model/eval
+# relies on and that would silently corrupt results if violated.
 
 from collections import namedtuple
 from pathlib import Path
@@ -24,7 +27,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DATA_DIR = Path(__file__).parent
 META_FILE = "df_meta.parquet"
 EVENT_FILE = "df_event.parquet"
 LABELS_FILE = "delphi_labels_index_name.csv"
@@ -81,7 +83,7 @@ def idx_in_vocab(idx: pd.Series, labels: Labels) -> bool:
 
 
 def idx_not_reserved(idx: pd.Series) -> bool:
-    # 0 = padding, 1 = no_event: injected by the pipeline, never a real event.
+    # 0 = padding, 1 = no_event: injected by the reader, never a real event.
     return bool((idx >= 2).all())
 
 
@@ -162,7 +164,7 @@ def gender_bl_sex_mismatches(df_meta: pd.DataFrame, df_event: pd.DataFrame, labe
     return int((tok != meta).sum())
 
 
-def test_data(data_dir=DATA_DIR, labels_path=None):
+def test_data(data_dir, labels_path=None):
     data_dir = Path(data_dir)
     labels = load_labels(labels_path or data_dir / LABELS_FILE)
     df_meta = pd.read_parquet(data_dir / META_FILE)
@@ -204,7 +206,15 @@ def test_data(data_dir=DATA_DIR, labels_path=None):
         print(f"WARNING: {mism} patients where df_meta.gender_bl disagrees with the df_event sex token")
 
 
-# ponytail: self-check so the logic is verifiable before the real parquet files exist.
+# %%
+# ── Run the gate ─────────────────────────────────────────────────────────────
+test_data(DATA_DIR, LABELS_PATH)
+print(f"OK: all checks passed for {DATA_DIR}")
+
+
+# %%
+# ── Optional: self-check on synthetic data (no real files needed) ────────────
+# Confirms the logic: valid data passes, and each perturbation trips its assert.
 def _selfcheck():
     import tempfile
 
@@ -235,7 +245,6 @@ def _selfcheck():
         event.to_parquet(d / EVENT_FILE)
         test_data(d)  # valid -> passes
 
-        # each perturbation must trip its assert
         mutations = (
             lambda e: pd.concat([e, e.iloc[[1]]]),                # duplicate token
             lambda e: e[e["idx"] != 13].reset_index(drop=True),   # patient 1 loses its only disease
@@ -243,39 +252,15 @@ def _selfcheck():
             lambda e: e.assign(idx=e["idx"].replace(2, 999)),     # idx out of vocab
         )
         for i, mut in enumerate(mutations):
-            e2 = mut(event.copy())
-            e2.to_parquet(d / EVENT_FILE)
+            mut(event.copy()).to_parquet(d / EVENT_FILE)
             try:
                 test_data(d)
             except AssertionError:
                 pass
             else:
-                raise SystemExit(f"expected AssertionError not raised for mutation {i}")
+                raise AssertionError(f"expected AssertionError not raised for mutation {i}")
 
     print("selfcheck OK")
 
 
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Validate the honic df_meta/df_event parquet files (plain asserts, no pytest)."
-    )
-    parser.add_argument(
-        "--data-dir",
-        default=str(DATA_DIR),
-        help=f"directory holding {META_FILE} and {EVENT_FILE} (default: this script's dir)",
-    )
-    parser.add_argument(
-        "--labels",
-        default=None,
-        help=f"path to {LABELS_FILE} (default: <data-dir>/{LABELS_FILE})",
-    )
-    parser.add_argument("--selfcheck", action="store_true", help="run the built-in synthetic self-check and exit")
-    args = parser.parse_args()
-
-    if args.selfcheck:
-        _selfcheck()
-    else:
-        test_data(args.data_dir, labels_path=args.labels)
-        print(f"OK: all checks passed for {args.data_dir}")
+_selfcheck()
