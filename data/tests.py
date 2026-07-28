@@ -89,28 +89,34 @@ def idx_not_reserved(idx: pd.Series) -> bool:
 
 def value_matches_idx(df_event: pd.DataFrame, labels: Labels) -> bool:
     # Keyed on idx (not label): robust to duplicate labels_short in the CSV.
-    mapped = df_event["idx"].map(labels.id2name)
-    bad = df_event.loc[mapped != df_event["value"], ["patient_id", "idx", "value"]]
+    # Dedup first: check the ~vocab distinct (idx, value) pairs, not all 20M rows -- avoids
+    # materializing a 20M-element object Series from .map (a real cost on 16 GB RAM).
+    pairs = df_event[["idx", "value"]].drop_duplicates()
+    bad = pairs.loc[pairs["idx"].map(labels.id2name) != pairs["value"]]
     if not bad.empty:
-        raise AssertionError(f"{len(bad)} rows where value != labels_short[idx], e.g.\n{bad.head()}")
+        raise AssertionError(f"{len(bad)} distinct (idx, value) pairs inconsistent with the label index:\n{bad}")
     return True
 
 
 def referential_integrity(df_meta: pd.DataFrame, df_event: pd.DataFrame) -> bool:
+    # unique() first so the set holds one entry per patient (~10^5), not all 20M rows.
     return bool(
         df_meta["patient_id"].is_unique
-        and set(df_event["patient_id"]) == set(df_meta["patient_id"])
         and df_meta["patient_id"].dtype == df_event["patient_id"].dtype
+        and set(df_event["patient_id"].unique()) == set(df_meta["patient_id"])
     )
 
 
 def sorted_by_patient_then_age(df_event: pd.DataFrame) -> bool:
-    # The reader never re-sorts: it reads the last row as exit time and the first
-    # occurrence as onset, so rows must be age-ascending within contiguous patient blocks.
+    # Rows must be age-ascending within contiguous patient blocks -- the reader reads the
+    # last row as exit time and the first occurrence as onset, and never re-sorts.
+    # Simple + vectorized, and unlike df.equals(df.sort_values(...)) it does NOT require
+    # patient_ids in globally sorted order, so valid unsorted-id data isn't rejected.
     pid = df_event["patient_id"]
-    ascending = df_event.groupby("patient_id", sort=False)["age"].apply(lambda s: s.is_monotonic_increasing).all()
-    # fillna(True): row 0's shift is NA (and under nullable "string" dtype != yields NA, not True)
-    contiguous = (pid != pid.shift()).fillna(True).sum() == pid.nunique()
+    boundary = pid.ne(pid.shift()).fillna(True)   # first row of each patient run
+    age_fell = df_event["age"].diff().lt(0)       # age dropped vs the previous row
+    ascending = not (age_fell & ~boundary).any()  # a drop is only allowed across a boundary
+    contiguous = boundary.sum() == pid.nunique()  # each patient appears as exactly one run
     return bool(ascending and contiguous)
 
 
@@ -149,8 +155,10 @@ def death_single_and_terminal(df_event: pd.DataFrame, labels: Labels) -> bool:
     if d.empty:
         return True
     once = d.groupby("patient_id").size().le(1).all()
-    max_age = df_event.groupby("patient_id")["age"].transform("max")
-    return bool(once and (d["age"] == max_age.loc[d.index]).all())
+    # aggregation (~10^5 rows), not a transform that expands back to 20M
+    patient_max = df_event.groupby("patient_id")["age"].max()
+    terminal = (d["age"].to_numpy() >= patient_max.reindex(d["patient_id"].to_numpy()).to_numpy()).all()
+    return bool(once and terminal)
 
 
 def _norm_sex(x):
@@ -246,10 +254,12 @@ def _selfcheck():
         test_data(d)  # valid -> passes
 
         mutations = (
-            lambda e: pd.concat([e, e.iloc[[1]]]),                # duplicate token
-            lambda e: e[e["idx"] != 13].reset_index(drop=True),   # patient 1 loses its only disease
-            lambda e: e.assign(age=e["age"] * 365.25),            # age in days
-            lambda e: e.assign(idx=e["idx"].replace(2, 999)),     # idx out of vocab
+            lambda e: pd.concat([e, e.iloc[[1]]]),                     # duplicate token
+            lambda e: e[e["idx"] != 13].reset_index(drop=True),        # patient 1 loses its only disease
+            lambda e: e.assign(age=e["age"] * 365.25),                 # age in days
+            lambda e: e.assign(idx=e["idx"].replace(2, 999)),          # idx out of vocab
+            lambda e: e.iloc[[1, 0, 2, 3, 4]].reset_index(drop=True),  # patient 1 rows out of age order
+            lambda e: e.iloc[[0, 2, 1, 3, 4]].reset_index(drop=True),  # patient blocks interleaved
         )
         for i, mut in enumerate(mutations):
             mut(event.copy()).to_parquet(d / EVENT_FILE)
