@@ -60,6 +60,36 @@ def batched_mann_whitney_auc(
     return n1, n2, auc
 
 
+def harrell_cindex(estimate, event_times, censor_times, anchor):
+    """Harrell's C-index for a forecast anchor (horizon-free). All args are (N,).
+
+    estimate    : risk score (higher = earlier event expected),
+    event_times : absolute first-occurrence age (NaN if the event never occurs),
+    censor_times: absolute last-seen age (exit) -- death censors here (cause-specific),
+    anchor      : t0, the prompt cutoff age.
+    Prevalent participants (event strictly before the anchor) are dropped; the clock
+    is re-zeroed at the anchor. Returns {"cindex", "n_event"} (cindex NaN if undefined).
+    Uses sksurv's C-optimized concordance (lazy import so `import eval` stays light).
+    """
+    from sksurv.metrics import concordance_index_censored
+
+    occ = event_times
+    keep = ~(~np.isnan(occ) & (occ < anchor))  # drop prevalent (event before t0)
+    event = ~np.isnan(occ[keep]) & (occ[keep] >= anchor[keep])
+    time = np.where(event, occ[keep], censor_times[keep]) - anchor[keep]
+    time = np.maximum(time, 1e-3)  # sksurv requires strictly positive times
+    est = estimate[keep]
+
+    out = {"cindex": float("nan"), "n_event": int(event.sum())}
+    if out["n_event"] == 0:
+        return out  # no cases -> concordance undefined
+    try:
+        out["cindex"] = float(concordance_index_censored(event, time, est)[0])
+    except Exception:  # e.g. no comparable pairs -- NaN, don't kill the run
+        pass
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # collators
 # --------------------------------------------------------------------------- #
