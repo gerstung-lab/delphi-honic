@@ -19,7 +19,7 @@ Run:
 import argparse
 import json
 import pprint
-from dataclasses import fields
+from dataclasses import asdict, fields
 
 import numpy as np
 import torch
@@ -40,7 +40,13 @@ NO_EVENT_TOKEN = 1
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt", required=True, help="path to the pretrained checkpoint (.pt)")
+    p.add_argument("--ckpt", default=None, help="path to the pretrained checkpoint (.pt); not needed with --random-init")
+    p.add_argument(
+        "--random-init",
+        action="store_true",
+        help="skip the checkpoint and evaluate a randomly-initialized model (chance baseline); "
+        "uses default DelphiConfig args, which match the pretrained architecture",
+    )
     p.add_argument("--data-dir", default="data", help="dir holding df_event.parquet + df_meta.parquet")
     p.add_argument("--df-event", default=None, help="override df_event path (default <data-dir>/df_event.parquet)")
     p.add_argument("--df-meta", default=None, help="override df_meta path (default <data-dir>/df_meta.parquet)")
@@ -61,17 +67,31 @@ def parse_args():
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.random_init and not args.ckpt:
+        p.error("--ckpt is required unless --random-init is set")
+    return args
 
 
-def load_model(ckpt_path, device):
-    ck = torch.load(ckpt_path, map_location=device, weights_only=False)
-    valid = {f.name for f in fields(DelphiConfig)}
-    cfg = DelphiConfig(**{k: v for k, v in ck["model_args"].items() if k in valid})
-    model = Delphi(cfg)
-    model.load_state_dict(ck["model"])
+def load_model(ckpt_path, device, random_init=False, seed=None):
+    """Build a Delphi model. random_init: a fresh model with default DelphiConfig
+    args (which match the pretrained architecture) and no weights loaded -- a
+    chance baseline; seed makes the random weights reproducible."""
+    if random_init:
+        if seed is not None:
+            torch.manual_seed(seed)
+        cfg = DelphiConfig()
+        model = Delphi(cfg)
+        model_args = asdict(cfg)
+    else:
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        valid = {f.name for f in fields(DelphiConfig)}
+        cfg = DelphiConfig(**{k: v for k, v in ck["model_args"].items() if k in valid})
+        model = Delphi(cfg)
+        model.load_state_dict(ck["model"])
+        model_args = ck["model_args"]
     model.to(device).eval()
-    return model, ck["model_args"]
+    return model, model_args
 
 
 def main():
@@ -82,7 +102,7 @@ def main():
     labels = args.labels or f"{data_dir}/delphi_labels_index_name.csv"
     device = args.device
 
-    model, model_args = load_model(args.ckpt, device)
+    model, model_args = load_model(args.ckpt, device, random_init=args.random_init, seed=args.seed)
     vocab_size = model_args["vocab_size"]
     ignore_tokens = set(model_args.get("ignore_tokens", [])) | {NO_EVENT_TOKEN}
     # targets = everything the model scores as a disease: all ids minus ignored

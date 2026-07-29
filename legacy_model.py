@@ -6,8 +6,12 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 
-Vendored verbatim from https://github.com/gerstung-lab/Delphi/blob/main/model.py
-(the legacy Delphi model), with the generate() method removed (not needed yet).
+Vendored from https://github.com/gerstung-lab/Delphi/blob/main/model.py (the legacy
+Delphi model), with the generate() method removed (not needed yet) and DelphiConfig
+defaults changed to the delphi-2m-og checkpoint (vocab_size=1270, n_embd=120,
+block_size=48, bias=False, t_min=0.1, mask_ties=True, ignore_tokens=[0,2..12]) so a
+default-constructed Delphi matches the pretrained architecture -- e.g. for the
+random-init chance baseline.
 """
 
 import math
@@ -141,17 +145,19 @@ class AgeEncoding(nn.Module):
 
 @dataclass
 class DelphiConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    # Defaults set to the delphi-2m-og checkpoint's model_args (was GPT-2's), so a
+    # default-constructed Delphi matches the pretrained architecture.
+    block_size: int = 48
+    vocab_size: int = 1270
     n_layer: int = 12
     n_head: int = 12
-    n_embd: int = 768
+    n_embd: int = 120
     dropout: float = 0.0
     token_dropout: float = 0.0
-    t_min: float = 1.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    mask_ties: bool = False
-    ignore_tokens: list = field(default_factory=lambda: [0])
+    t_min: float = 0.1
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    mask_ties: bool = True
+    ignore_tokens: list = field(default_factory=lambda: [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
 
 class Delphi(nn.Module):
 
