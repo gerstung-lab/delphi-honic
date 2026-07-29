@@ -72,7 +72,8 @@ def parse_args():
         "--chunk-size",
         type=int,
         default=128,
-        help="column-chunk the AUC ranking to cap memory (default 128: ~82 GB peak at 2M x 1300; 0 = no chunking)",
+        help="column-block size for the per-stratum AUC (masks+scores+ranking); caps the "
+        "AUC-stage transient to ~(N, chunk). Default 128; 0 = no chunking (whole V at once)",
     )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
@@ -111,6 +112,28 @@ def _cell(res, d):
         "ctl_count": int(ctl_counts[d]),
         "dis_count": int(case_counts[d]),
     }
+
+
+def _stratum_auc(is_case, dis_rates, dis_times, ctl_bin, is_gr, lo, hi, chunk):
+    """Windowed AUC for one (region, sex, age-bin) stratum, built in COLUMN BLOCKS so
+    no full (N, V) mask/score/rank array is ever materialized -- caps the transient to
+    (N, chunk). controls = in-group, event-free, with a bin control rate; cases =
+    in-group onsets in [lo, hi). Returns (n_ctl, n_case, auc), each (V,). chunk=None -> one block.
+    """
+    V = dis_rates.shape[1]
+    step = V if chunk is None else chunk
+    n_ctl = np.zeros(V, dtype=np.int64)
+    n_case = np.zeros(V, dtype=np.int64)
+    auc = np.full(V, np.nan, dtype=float)
+    for s in range(0, V, step):
+        e = min(s + step, V)
+        ic, cs, dt = is_case[:, s:e], ctl_bin[:, s:e], dis_times[:, s:e]
+        ctl_valid = (~ic) & ~np.isnan(cs) & is_gr
+        # onset in [lo, hi): edges[i] <= age < edges[i+1] (matches searchsorted side="right")
+        case_valid = ic & (dt >= lo) & (dt < hi) & is_gr
+        scores = np.where(case_valid, dis_rates[:, s:e], np.where(ctl_valid, cs, np.nan))
+        n_ctl[s:e], n_case[s:e], auc[s:e] = batched_mann_whitney_auc(scores, ctl_valid, case_valid)
+    return n_ctl, n_case, auc
 
 
 def main():
@@ -197,6 +220,7 @@ def main():
     # (N, V) dis_time_bin: np.searchsorted would build an int64 (N, V) temp (~21 GB at
     # 2M x 1300, ~40 GB with the `- 1`) before we could downcast it.
     is_case = ~np.isnan(dis_rates)  # (N, V)
+    chunk = args.chunk_size if args.chunk_size > 0 else None  # column-block size (0/neg -> no chunking)
 
     results = {}
     pbar = tqdm(total=len(region_groups) * 2 * n_bins, desc="AUC (region x sex x age bin)", leave=False)
@@ -205,14 +229,8 @@ def main():
             is_gr = (is_g & is_r)[:, None]
             for i in range(n_bins):
                 lo, hi = age_group_edges[i], age_group_edges[i + 1]
-                ctl_score = ctl_rates[:, i, :]
-                ctl_valid = (~is_case) & ~np.isnan(ctl_score) & is_gr
-                # onset in bin i: edges[i] <= age < edges[i+1] (matches searchsorted side="right")
-                case_valid = is_case & (dis_times >= lo) & (dis_times < hi) & is_gr
-                scores = np.where(case_valid, dis_rates, np.where(ctl_valid, ctl_score, np.nan))
-                results[(region, sex_label, i)] = batched_mann_whitney_auc(
-                    scores, ctl=ctl_valid, case=case_valid,
-                    chunk_size=(args.chunk_size if args.chunk_size > 0 else None),  # 0 -> no chunking
+                results[(region, sex_label, i)] = _stratum_auc(
+                    is_case, dis_rates, dis_times, ctl_rates[:, i, :], is_gr, lo, hi, chunk
                 )
                 pbar.update(1)
     pbar.close()

@@ -37,38 +37,28 @@ def eval_iter(total_size: int, batch_size: int):
 # AUC
 # --------------------------------------------------------------------------- #
 def batched_mann_whitney_auc(
-    scores: np.ndarray, ctl: np.ndarray, case: np.ndarray, chunk_size: int | None = None
+    scores: np.ndarray, ctl: np.ndarray, case: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Column-wise AUC over an (N, V) score matrix.
 
     Scores outside `ctl | case` or NaN are excluded from ranking (per column).
-    Returns (ctl_counts, case_counts, auc), each of shape (V,).
-
-    chunk_size: rank columns in blocks of this many. scipy rankdata allocates a
-    float64 rank matrix + an int64 argsort, so an unchunked (N, V) rank at large N
-    (e.g. 2M x 1300 ~ 60 GB) OOMs; per-column AUC is independent, so chunking is
-    exact and just caps the transient to (N, chunk_size). None -> one pass over all V.
+    Returns (ctl_counts, case_counts, auc), each of shape (V,). Callers that need to
+    cap memory should pass column blocks (rankdata allocates a full float64 rank
+    matrix + int64 argsort); per-column AUC is independent, so block-wise is exact.
     """
     assert scores.shape == ctl.shape == case.shape
-    V = scores.shape[1]
-    step = V if chunk_size is None else chunk_size
-    n1 = np.zeros(V, dtype=np.int64)
-    n2 = np.zeros(V, dtype=np.int64)
-    auc = np.full(V, np.nan, dtype=float)
-    for s in range(0, V, step):
-        e = min(s + step, V)
-        c, k = ctl[:, s:e], case[:, s:e]
-        masked = np.where(c | k, scores[:, s:e], np.nan)
-        ranks = rankdata(masked, method="average", axis=0, nan_policy="omit")
-        valid = ~np.isnan(masked)
-        a1 = (c & valid).sum(axis=0)
-        a2 = (k & valid).sum(axis=0)
-        R1 = np.where(c & valid, ranks, 0).sum(axis=0)
-        U1 = a1 * a2 + 0.5 * a1 * (a1 + 1) - R1
-        denom = a1 * a2
-        auc_c = np.full(denom.shape, np.nan, dtype=float)
-        np.divide(U1, denom, out=auc_c, where=denom > 0)
-        n1[s:e], n2[s:e], auc[s:e] = a1, a2, auc_c
+    masked = np.where(ctl | case, scores, np.nan)
+    ranks = rankdata(masked, method="average", axis=0, nan_policy="omit")
+
+    valid = ~np.isnan(masked)
+    n1 = (ctl & valid).sum(axis=0)
+    n2 = (case & valid).sum(axis=0)
+    R1 = np.where(ctl & valid, ranks, 0).sum(axis=0)
+
+    U1 = n1 * n2 + 0.5 * n1 * (n1 + 1) - R1
+    denom = n1 * n2
+    auc = np.full(denom.shape, np.nan, dtype=float)
+    np.divide(U1, denom, out=auc, where=denom > 0)
     return n1, n2, auc
 
 
