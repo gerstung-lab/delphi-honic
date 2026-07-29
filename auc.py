@@ -24,16 +24,11 @@ from dataclasses import asdict, fields
 
 import numpy as np
 import torch
+from scipy.stats import rankdata
 from tqdm import tqdm
 
 from dataset import DAYS_PER_YEAR, Dataset, HonicReader
-from eval import (
-    AgeStratRatesCollator,
-    DiseaseRatesCollator,
-    batched_mann_whitney_auc,
-    eval_iter,
-    nearest_prediction,
-)
+from eval import AgeStratRatesCollator, DiseaseRatesCollator, eval_iter, nearest_prediction
 from legacy_model import Delphi, DelphiConfig
 
 NO_EVENT_TOKEN = 1
@@ -74,13 +69,6 @@ def parse_args():
         help="crop each sequence to this many tokens (default: checkpoint's; 0 = no crop)",
     )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument(
-        "--chunk-size",
-        type=int,
-        default=128,
-        help="column-block size for the per-stratum AUC (masks+scores+ranking); caps the "
-        "AUC-stage transient to ~(N, chunk). Default 128; 0 = no chunking (whole V at once)",
-    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
     if not args.random_init and not args.ckpt:
@@ -122,7 +110,7 @@ def _cell(res, d):
 
 def _warn_stale_cache(cached_cfg, cur_cfg):
     """Loud (non-fatal) warning if the cache was made with args that change the cached
-    arrays. by_region/chunk_size/out/device/batch_size are applied after the cache, so
+    arrays. by_region/out/device/batch_size are applied after the cache, so
     they may differ freely and are not checked."""
     if not cached_cfg:
         return
@@ -133,25 +121,40 @@ def _warn_stale_cache(cached_cfg, cur_cfg):
         print(f"WARNING: cache args differ from current (key: cached -> now); results may be stale:\n  {diffs}")
 
 
-def _stratum_auc(is_case, dis_rates, dis_times, ctl_bin, is_gr, lo, hi, chunk):
-    """Windowed AUC for one (region, sex, age-bin) stratum, built in COLUMN BLOCKS so
-    no full (N, V) mask/score/rank array is ever materialized -- caps the transient to
-    (N, chunk). controls = in-group, event-free, with a bin control rate; cases =
-    in-group onsets in [lo, hi). Returns (n_ctl, n_case, auc), each (V,). chunk=None -> one block.
+def _stratum_auc(is_case, dis_rates, dis_times, ctl_bin, g, lo, hi):
+    """Windowed AUC for one (region, sex, age-bin) stratum, COLUMN BY COLUMN with row
+    removal: for each disease we keep only the rows that are a valid control or case in
+    this group and rank JUST those -- no full-N argsort over out-of-group / NaN rows.
+
+    g: (N,) in-group bool (this region+sex). controls = in-group, not a case of the
+    disease, with a bin control rate; cases = in-group onsets in [lo, hi).
+    Returns (n_ctl, n_case, auc), each (V,). AUC = P(case score > control score), ties 0.5
+    -- same statistic as batched_mann_whitney_auc.
     """
     V = dis_rates.shape[1]
-    step = V if chunk is None else chunk
     n_ctl = np.zeros(V, dtype=np.int64)
     n_case = np.zeros(V, dtype=np.int64)
     auc = np.full(V, np.nan, dtype=float)
-    for s in range(0, V, step):
-        e = min(s + step, V)
-        ic, cs, dt = is_case[:, s:e], ctl_bin[:, s:e], dis_times[:, s:e]
-        ctl_valid = (~ic) & ~np.isnan(cs) & is_gr
-        # onset in [lo, hi): edges[i] <= age < edges[i+1] (matches searchsorted side="right")
-        case_valid = ic & (dt >= lo) & (dt < hi) & is_gr
-        scores = np.where(case_valid, dis_rates[:, s:e], np.where(ctl_valid, cs, np.nan))
-        n_ctl[s:e], n_case[s:e], auc[s:e] = batched_mann_whitney_auc(scores, ctl_valid, case_valid)
+    gi = np.flatnonzero(g)  # in-group row indices (drops out-of-group rows once)
+    if gi.size == 0:
+        return n_ctl, n_case, auc
+    for d in range(V):
+        cd = ctl_bin[gi, d]  # (n_g,) control rate for disease d in this bin
+        ic = is_case[gi, d]  # (n_g,) does this in-group participant develop d at all
+        cv = (~ic) & ~np.isnan(cd)  # controls: not a case, has a bin control rate
+        dtd = dis_times[gi, d]
+        kv = ic & (dtd >= lo) & (dtd < hi)  # cases: onset in [lo, hi) (matches searchsorted right)
+        n1 = int(cv.sum())
+        n2 = int(kv.sum())
+        n_ctl[d] = n1
+        n_case[d] = n2
+        if n1 == 0 or n2 == 0:
+            continue  # AUC undefined without both controls and cases
+        valid = cv | kv
+        sc = np.where(kv, dis_rates[gi, d], cd)[valid]  # scores of the k=n1+n2 real rows only
+        ranks = rankdata(sc)  # average ties; k values, not N
+        R1 = ranks[cv[valid]].sum()  # summed control ranks
+        auc[d] = (n1 * n2 + 0.5 * n1 * (n1 + 1) - R1) / (n1 * n2)
     return n_ctl, n_case, auc
 
 
@@ -253,26 +256,19 @@ def main():
     else:
         region_groups = [(None, np.ones(len(pids), dtype=bool))]
 
-    # Bin each case by the age of its prediction position (== nearest_t0), matching
-    # the control binning. For a fixed (region, sex, age bin), one column-wise AUC
-    # pass: controls = matching participants who never develop the token (their bin
-    # control rate); cases = matching participants whose onset falls in this bin.
-    # Bin membership is compared inline against the two bin edges in the loop below
-    # (a transient (N, V) bool, freed each iteration) rather than materializing a full
-    # (N, V) dis_time_bin: np.searchsorted would build an int64 (N, V) temp (~21 GB at
-    # 2M x 1300, ~40 GB with the `- 1`) before we could downcast it.
+    # is_case[:, d] marks participants who develop disease d at all; _stratum_auc bins
+    # cases inline (dis_times in [lo, hi)) and ranks only the valid rows per column.
     is_case = ~np.isnan(dis_rates)  # (N, V)
-    chunk = args.chunk_size if args.chunk_size > 0 else None  # column-block size (0/neg -> no chunking)
 
     results = {}
     pbar = tqdm(total=len(region_groups) * 2 * n_bins, desc="AUC (region x sex x age bin)", leave=False)
     for region, is_r in region_groups:
         for sex_label, is_g in [("female", is_female), ("male", ~is_female)]:
-            is_gr = (is_g & is_r)[:, None]
+            g = is_g & is_r  # (N,) in-group mask for this region+sex
             for i in range(n_bins):
                 lo, hi = age_group_edges[i], age_group_edges[i + 1]
                 results[(region, sex_label, i)] = _stratum_auc(
-                    is_case, dis_rates, dis_times, ctl_rates[:, i, :], is_gr, lo, hi, chunk
+                    is_case, dis_rates, dis_times, ctl_rates[:, i, :], g, lo, hi
                 )
                 pbar.update(1)
     pbar.close()
