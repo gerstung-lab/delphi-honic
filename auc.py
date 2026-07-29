@@ -55,6 +55,12 @@ def parse_args():
     p.add_argument("--fold", default=None, help="fold to evaluate (default: whole cohort)")
     p.add_argument("--subsample", type=int, default=None, help="randomly evaluate only this many participants (default: all)")
     p.add_argument("--by-region", action="store_true", help="add a region stratification layer (df_meta.region_bl); appends '_by_region' to --out")
+    p.add_argument(
+        "--cache",
+        default=None,
+        help="path to a .pt forward-pass cache: if it exists, load it and skip the model + forward "
+        "loop (the reader/df_event still loads, for is_female/region); otherwise run and save it here",
+    )
     p.add_argument("--out", required=True, help="output CSV path")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--offset", type=float, default=0.0, help="forecast offset in YEARS (score at t1 - offset)")
@@ -114,6 +120,19 @@ def _cell(res, d):
     }
 
 
+def _warn_stale_cache(cached_cfg, cur_cfg):
+    """Loud (non-fatal) warning if the cache was made with args that change the cached
+    arrays. by_region/chunk_size/out/device/batch_size are applied after the cache, so
+    they may differ freely and are not checked."""
+    if not cached_cfg:
+        return
+    baked = ["ckpt", "random_init", "data_dir", "df_event", "df_meta", "labels", "fold",
+             "subsample", "offset", "age_start", "age_end", "age_gap", "block_size", "seed"]
+    diffs = {k: (cached_cfg.get(k), cur_cfg.get(k)) for k in baked if cached_cfg.get(k) != cur_cfg.get(k)}
+    if diffs:
+        print(f"WARNING: cache args differ from current (key: cached -> now); results may be stale:\n  {diffs}")
+
+
 def _stratum_auc(is_case, dis_rates, dis_times, ctl_bin, is_gr, lo, hi, chunk):
     """Windowed AUC for one (region, sex, age-bin) stratum, built in COLUMN BLOCKS so
     no full (N, V) mask/score/rank array is ever materialized -- caps the transient to
@@ -145,60 +164,83 @@ def main():
     device = args.device
     pprint.pp(vars(args))  # echo run config (no longer saved in the CSV)
 
-    model, model_args = load_model(args.ckpt, device, random_init=args.random_init, seed=args.seed)
-    vocab_size = model_args["vocab_size"]
-    ignore_tokens = set(model_args.get("ignore_tokens", [])) | {NO_EVENT_TOKEN}
-    # targets = everything the model scores as a disease: all ids minus ignored
-    # covariates/sex/padding and the no_event augmentation. Matches delphi's
-    # (model.targets - augmentation_tokens); includes the death token.
-    targets = torch.tensor(
-        sorted(v for v in range(vocab_size) if v not in ignore_tokens), device=device
-    )
-
-    # crop length: checkpoint's block_size unless overridden; 0/negative disables
-    block_size = model_args.get("block_size") if args.block_size is None else args.block_size
-    block_size = block_size if block_size and block_size > 0 else None
-
+    # The reader (df_event load) is always needed -- is_female/region/detokenizer come
+    # from it, on both the cache and compute paths.
     reader = HonicReader(df_event, df_meta, labels)
-    pids = reader.participants(args.fold)
-    if args.subsample is not None and args.subsample < len(pids):
-        sub = np.random.default_rng(args.seed).choice(len(pids), size=args.subsample, replace=False)
-        pids = pids[np.sort(sub)]
-    ds = Dataset(reader, pids, block_size=block_size, seed=args.seed)
-    # score short sequences together to cut padding; rebind pids to the new row order
-    pids = ds.sort_by_length(descending=True)
-
-    offset_days = args.offset * DAYS_PER_YEAR
     age_group_edges = np.arange(args.age_start, args.age_end + args.age_gap, args.age_gap) * DAYS_PER_YEAR
     n_bins = len(age_group_edges) - 1
 
-    gen = torch.Generator(device=device).manual_seed(args.seed)
-    ctl_collator = AgeStratRatesCollator(
-        age_groups=torch.from_numpy(age_group_edges).float().to(device), n_participants=len(ds), generator=gen
-    )
-    dis_collator = DiseaseRatesCollator(targets=targets, n_participants=len(ds))
+    if args.cache and os.path.exists(args.cache):
+        # cache hit: skip the model + forward loop; reuse the saved forward-pass arrays.
+        blob = torch.load(args.cache, weights_only=False)
+        _warn_stale_cache(blob.get("config"), vars(args))
+        pids = blob["pids"]  # the row order the arrays are in (post sort_by_length)
+        target_ids = blob["targets"]
+        ctl_rates = blob["ctl_rates"].numpy()  # (N, n_bins, V)
+        dis_rates = blob["dis_rates"].numpy()  # (N, V)
+        dis_times = blob["dis_times"].numpy()  # (N, V)
+        print(f"loaded forward-pass cache: {args.cache}  ({len(pids)} participants)")
+    else:
+        model, model_args = load_model(args.ckpt, device, random_init=args.random_init, seed=args.seed)
+        vocab_size = model_args["vocab_size"]
+        ignore_tokens = set(model_args.get("ignore_tokens", [])) | {NO_EVENT_TOKEN}
+        # targets = everything the model scores as a disease: all ids minus ignored
+        # covariates/sex/padding and no_event. Matches delphi's model.targets - augmentation; incl. death.
+        targets = torch.tensor(
+            sorted(v for v in range(vocab_size) if v not in ignore_tokens), device=device
+        )
+        target_ids = targets.cpu().numpy()
 
-    with torch.no_grad():
-        for batch_idx in tqdm(
-            eval_iter(len(ds), args.batch_size),
-            total=int(np.ceil(len(ds) / args.batch_size)),
-            leave=False,
-        ):
-            x0, t0, x1, t1 = (b.to(device) for b in ds.get_batch(batch_idx))
-            logits, _, _ = model(x0, t0)  # legacy interface: (logits, loss, att)
-            # scores at the input step strictly before each target's (t1 - offset)
-            scores, nearest_t0 = nearest_prediction(x0, t0, logits, t1 - offset_days)
-            scores = scores.half()
-            ctl_collator.step(timesteps=nearest_t0, logits=scores)
-            dis_collator.step(tokens=x1, timesteps=nearest_t0, logits=scores)
+        # crop length: checkpoint's block_size unless overridden; 0/negative disables
+        block_size = model_args.get("block_size") if args.block_size is None else args.block_size
+        block_size = block_size if block_size and block_size > 0 else None
 
-    ctl_rates, _ = ctl_collator.finalize()  # (N, n_bins, V)
-    dis_rates, dis_times = dis_collator.finalize()  # (N, V), (N, V)
-    ctl_rates = ctl_rates.numpy()
-    dis_rates = dis_rates.numpy()
-    dis_times = dis_times.numpy()
-    del ctl_collator, dis_collator  # drop the per-batch lists finalize() kept alive (else ~2x memory)
-    is_female = reader.is_female(pids)  # (N,) bool, aligned to the reordered rows
+        pids = reader.participants(args.fold)
+        if args.subsample is not None and args.subsample < len(pids):
+            sub = np.random.default_rng(args.seed).choice(len(pids), size=args.subsample, replace=False)
+            pids = pids[np.sort(sub)]
+        ds = Dataset(reader, pids, block_size=block_size, seed=args.seed)
+        # score short sequences together to cut padding; rebind pids to the new row order
+        pids = ds.sort_by_length(descending=True)
+
+        offset_days = args.offset * DAYS_PER_YEAR
+        gen = torch.Generator(device=device).manual_seed(args.seed)
+        ctl_collator = AgeStratRatesCollator(
+            age_groups=torch.from_numpy(age_group_edges).float().to(device), n_participants=len(ds), generator=gen
+        )
+        dis_collator = DiseaseRatesCollator(targets=targets, n_participants=len(ds))
+
+        with torch.no_grad():
+            for batch_idx in tqdm(
+                eval_iter(len(ds), args.batch_size),
+                total=int(np.ceil(len(ds) / args.batch_size)),
+                leave=False,
+            ):
+                x0, t0, x1, t1 = (b.to(device) for b in ds.get_batch(batch_idx))
+                logits, _, _ = model(x0, t0)  # legacy interface: (logits, loss, att)
+                # scores at the input step strictly before each target's (t1 - offset)
+                scores, nearest_t0 = nearest_prediction(x0, t0, logits, t1 - offset_days)
+                scores = scores.half()
+                ctl_collator.step(timesteps=nearest_t0, logits=scores)
+                dis_collator.step(tokens=x1, timesteps=nearest_t0, logits=scores)
+
+        ctl_rates_t, _ = ctl_collator.finalize()  # (N, n_bins, V)
+        dis_rates_t, dis_times_t = dis_collator.finalize()  # (N, V), (N, V)
+        if args.cache:
+            torch.save(
+                {
+                    "ctl_rates": ctl_rates_t, "dis_rates": dis_rates_t, "dis_times": dis_times_t,
+                    "pids": pids, "targets": target_ids, "config": vars(args),
+                },
+                args.cache,
+            )
+            print(f"saved forward-pass cache: {args.cache}")
+        ctl_rates = ctl_rates_t.numpy()
+        dis_rates = dis_rates_t.numpy()
+        dis_times = dis_times_t.numpy()
+        del ctl_rates_t, dis_rates_t, dis_times_t, ctl_collator, dis_collator
+
+    is_female = reader.is_female(pids)  # (N,) bool, aligned to the array row order
 
     # Region is just one more stratification dimension: a list of (label, row-mask)
     # groups. Turning it OFF doesn't drop the loop -- it collapses the dimension to
@@ -244,7 +286,7 @@ def main():
     # stratification level (and column) is absent.
     fieldnames = ["token"] + (["region"] if args.by_region else []) + ["sex", "age_bin", "auc", "ctl_count", "dis_count"]
     rows = []
-    for d in targets.cpu().numpy().tolist():
+    for d in target_ids.tolist():
         icd = reader.detokenizer.get(int(d), str(d))
         for region, _ in region_groups:
             for sex_label in ("female", "male"):
@@ -263,7 +305,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     strata = f"{len(region_groups)} regions x " if args.by_region else ""
-    print(f"Saved to {out_path}  ({len(rows)} rows = {len(targets)} tokens x {strata}{len(age_group_keys)} age bins x 2 sexes)")
+    print(f"Saved to {out_path}  ({len(rows)} rows = {len(target_ids)} tokens x {strata}{len(age_group_keys)} age bins x 2 sexes)")
 
     death_name = reader.detokenizer.get(reader.death_token, "death")
     print(f"\n=== {death_name} ===")
