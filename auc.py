@@ -18,6 +18,7 @@ Run:
 
 import argparse
 import json
+import pprint
 from dataclasses import fields
 
 import numpy as np
@@ -45,6 +46,7 @@ def parse_args():
     p.add_argument("--df-meta", default=None, help="override df_meta path (default <data-dir>/df_meta.parquet)")
     p.add_argument("--labels", default=None, help="label index CSV (default <data-dir>/delphi_labels_index_name.csv)")
     p.add_argument("--fold", default=None, help="fold to evaluate (default: whole cohort)")
+    p.add_argument("--subsample", type=int, default=None, help="randomly evaluate only this many participants (default: all)")
     p.add_argument("--out", required=True, help="output JSON path")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--offset", type=float, default=0.0, help="forecast offset in YEARS (score at t1 - offset)")
@@ -95,7 +97,11 @@ def main():
     block_size = block_size if block_size and block_size > 0 else None
 
     reader = HonicReader(df_event, df_meta, labels)
-    ds = Dataset(reader, reader.participants(args.fold), block_size=block_size, seed=args.seed)
+    pids = reader.participants(args.fold)
+    if args.subsample is not None and args.subsample < len(pids):
+        sub = np.random.default_rng(args.seed).choice(len(pids), size=args.subsample, replace=False)
+        pids = pids[np.sort(sub)]
+    ds = Dataset(reader, pids, block_size=block_size, seed=args.seed)
     # score short sequences together to cut padding; rebind pids to the new row order
     pids = ds.sort_by_length(descending=True)
 
@@ -168,6 +174,10 @@ def main():
     with open(out_path, "w") as f:
         json.dump({"config": vars(args), "logbook": logbook}, f, indent=4)
     print(f"Saved to {out_path}  ({len(logbook)} tokens x {len(age_group_keys)} age bins x 2 sexes)")
+
+    death_name = reader.detokenizer.get(reader.death_token, "death")
+    print(f"\n=== {death_name} ===")
+    pprint.pp(logbook.get(death_name, {}))
 
 
 if __name__ == "__main__":
