@@ -57,6 +57,11 @@ class HonicReader:
         meta = pd.read_parquet(df_meta_path, columns=None)
         self._participants = meta["patient_id"].to_numpy()
         self._fold_of = meta["fold"].to_numpy() if "fold" in meta.columns else None
+        # per-patient baseline region (the one nullable covariate); NA -> None
+        self._region_of = {
+            pid: (None if pd.isna(r) else r)
+            for pid, r in zip(meta["patient_id"], meta["region_bl"])
+        }
 
     def __getitem__(self, pid):
         i = self.start_pos[pid]
@@ -79,6 +84,11 @@ class HonicReader:
             j = self.start_pos[pid]
             out[i] = (self.tokens[j : j + self.seq_len[pid]] == self.female_token).any()
         return out
+
+    def region(self, pids) -> np.ndarray:
+        """(N,) baseline region (df_meta.region_bl) per pid, aligned to `pids`.
+        Object array; None where region is missing (region_bl is the one nullable column)."""
+        return np.array([self._region_of.get(p) for p in pids], dtype=object)
 
     def exit_times(self, pids) -> np.ndarray:
         """(N,) last-token age in DAYS = censor/exit age (stream is age-ascending)."""
