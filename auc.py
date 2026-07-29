@@ -17,7 +17,8 @@ Run:
 """
 
 import argparse
-import json
+import csv
+import os
 import pprint
 from dataclasses import asdict, fields
 
@@ -53,7 +54,8 @@ def parse_args():
     p.add_argument("--labels", default=None, help="label index CSV (default <data-dir>/delphi_labels_index_name.csv)")
     p.add_argument("--fold", default=None, help="fold to evaluate (default: whole cohort)")
     p.add_argument("--subsample", type=int, default=None, help="randomly evaluate only this many participants (default: all)")
-    p.add_argument("--out", required=True, help="output JSON path")
+    p.add_argument("--by-region", action="store_true", help="add a region stratification layer (df_meta.region_bl); appends '_by_region' to --out")
+    p.add_argument("--out", required=True, help="output CSV path")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--offset", type=float, default=0.0, help="forecast offset in YEARS (score at t1 - offset)")
     p.add_argument("--age-start", type=int, default=40)
@@ -94,6 +96,17 @@ def load_model(ckpt_path, device, random_init=False, seed=None):
     return model, model_args
 
 
+def _cell(res, d):
+    """One logbook cell for disease token `d` from a batched_mann_whitney_auc result."""
+    ctl_counts, case_counts, aucs = res
+    auc = aucs[d]
+    return {
+        "auc": round(float(auc), 4) if not np.isnan(auc) else None,
+        "ctl_count": int(ctl_counts[d]),
+        "dis_count": int(case_counts[d]),
+    }
+
+
 def main():
     args = parse_args()
     data_dir = args.data_dir
@@ -101,6 +114,7 @@ def main():
     df_meta = args.df_meta or f"{data_dir}/df_meta.parquet"
     labels = args.labels or f"{data_dir}/delphi_labels_index_name.csv"
     device = args.device
+    pprint.pp(vars(args))  # echo run config (no longer saved in the CSV)
 
     model, model_args = load_model(args.ckpt, device, random_init=args.random_init, seed=args.seed)
     vocab_size = model_args["vocab_size"]
@@ -156,48 +170,70 @@ def main():
     dis_times = dis_times.numpy()
     is_female = reader.is_female(pids)  # (N,) bool, aligned to the reordered rows
 
+    # Region is just one more stratification dimension: a list of (label, row-mask)
+    # groups. Turning it OFF doesn't drop the loop -- it collapses the dimension to
+    # a single group covering everyone, so the compute + logbook loops below are
+    # identical either way. (AUC can't be marginalized after the fact, so "off"
+    # genuinely recomputes over the merged cohort rather than pooling regions.)
+    if args.by_region:
+        regions = np.array(["unknown" if r is None else str(r) for r in reader.region(pids)])
+        region_groups = [(r, regions == r) for r in sorted(set(regions.tolist()))]  # missing -> "unknown"
+    else:
+        region_groups = [(None, np.ones(len(pids), dtype=bool))]
+
     # Bin each case by the age of its prediction position (== nearest_t0), matching
-    # the control binning. For a fixed (sex, age bin), one column-wise AUC pass:
-    # controls = same-sex who never develop the token (their bin control rate),
-    # cases = same-sex whose onset falls in this bin (their pre-onset rate).
+    # the control binning. For a fixed (region, sex, age bin), one column-wise AUC
+    # pass: controls = matching participants who never develop the token (their bin
+    # control rate); cases = matching participants whose onset falls in this bin.
     dis_time_bin = np.searchsorted(age_group_edges, dis_times, side="right") - 1  # (N, V)
     is_case = ~np.isnan(dis_rates)  # (N, V)
 
     results = {}
-    for sex_label, is_g in [("female", is_female), ("male", ~is_female)]:
-        for i in range(n_bins):
-            ctl_score = ctl_rates[:, i, :]
-            ctl_valid = (~is_case) & ~np.isnan(ctl_score) & is_g[:, None]
-            case_valid = is_case & (dis_time_bin == i) & is_g[:, None]
-            scores = np.where(case_valid, dis_rates, np.where(ctl_valid, ctl_score, np.nan))
-            results[(sex_label, i)] = batched_mann_whitney_auc(scores, ctl=ctl_valid, case=case_valid)
+    for region, is_r in region_groups:
+        for sex_label, is_g in [("female", is_female), ("male", ~is_female)]:
+            is_gr = (is_g & is_r)[:, None]
+            for i in range(n_bins):
+                ctl_score = ctl_rates[:, i, :]
+                ctl_valid = (~is_case) & ~np.isnan(ctl_score) & is_gr
+                case_valid = is_case & (dis_time_bin == i) & is_gr
+                scores = np.where(case_valid, dis_rates, np.where(ctl_valid, ctl_score, np.nan))
+                results[(region, sex_label, i)] = batched_mann_whitney_auc(
+                    scores, ctl=ctl_valid, case=case_valid
+                )
 
     age_group_keys = [
         f"{int(start / DAYS_PER_YEAR)}-{int(end / DAYS_PER_YEAR)}"
         for start, end in zip(age_group_edges[:-1], age_group_edges[1:])
     ]
-    logbook = {}
+    # Flatten to one row per (token, [region,] sex, age_bin): each nesting key is a
+    # column. The region column exists only when --by-region -- off means that
+    # stratification level (and column) is absent.
+    fieldnames = ["token"] + (["region"] if args.by_region else []) + ["sex", "age_bin", "auc", "ctl_count", "dis_count"]
+    rows = []
     for d in targets.cpu().numpy().tolist():
         icd = reader.detokenizer.get(int(d), str(d))
-        logbook[icd] = {"female": {}, "male": {}}
-        for sex_label in ("female", "male"):
-            for i, age_grp in enumerate(age_group_keys):
-                ctl_counts, case_counts, aucs = results[(sex_label, i)]
-                auc = aucs[d]
-                logbook[icd][sex_label][age_grp] = {
-                    "auc": round(float(auc), 4) if not np.isnan(auc) else None,
-                    "ctl_count": int(ctl_counts[d]),
-                    "dis_count": int(case_counts[d]),
-                }
+        for region, _ in region_groups:
+            for sex_label in ("female", "male"):
+                for i, age_grp in enumerate(age_group_keys):
+                    row = {"token": icd, "sex": sex_label, "age_bin": age_grp, **_cell(results[(region, sex_label, i)], d)}
+                    if args.by_region:
+                        row["region"] = region
+                    rows.append(row)
 
     out_path = args.out
-    with open(out_path, "w") as f:
-        json.dump({"config": vars(args), "logbook": logbook}, f, indent=4)
-    print(f"Saved to {out_path}  ({len(logbook)} tokens x {len(age_group_keys)} age bins x 2 sexes)")
+    if args.by_region:
+        root, ext = os.path.splitext(out_path)
+        out_path = f"{root}_by_region{ext}"
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    strata = f"{len(region_groups)} regions x " if args.by_region else ""
+    print(f"Saved to {out_path}  ({len(rows)} rows = {len(targets)} tokens x {strata}{len(age_group_keys)} age bins x 2 sexes)")
 
     death_name = reader.detokenizer.get(reader.death_token, "death")
     print(f"\n=== {death_name} ===")
-    pprint.pp(logbook.get(death_name, {}))
+    pprint.pp([r for r in rows if r["token"] == death_name])
 
 
 if __name__ == "__main__":
