@@ -215,7 +215,7 @@ class Delphi(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False):
+    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False, return_attn=False):
         device = idx.device
         b, t = idx.size()
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -238,12 +238,18 @@ class Delphi(nn.Module):
         attn_mask *= torch.tril(torch.ones(idx.size(1),idx.size(1), device=device))[None,None,:,:] > 0 #self.transformer.h[0].attn.bias[:,:,:idx.size(1),:idx.size(1)] > 0
 
 
-        att = []
+        # return_attn=False (eval default): don't keep per-layer attention. Each block's
+        # (B, n_head, T, T) weights are freed as the loop advances instead of being
+        # stacked into an (n_layer, B, n_head, T, T) tensor and returned -- that stack is
+        # pure memory/alloc churn when the caller discards att (auc/calibration/forecast do).
+        att = [] if return_attn else None
         for block in self.transformer.h:
             x, a = block(x, attn_mask)
-            att.append(a)
+            if return_attn:
+                att.append(a)
         x = self.transformer.ln_f(x)
-        att = torch.stack(att)
+        if return_attn:
+            att = torch.stack(att)
 
         if targets is not None:
             # next token cross entropy loss, padding masked
