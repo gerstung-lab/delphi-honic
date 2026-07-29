@@ -62,6 +62,7 @@ class HonicReader:
             pid: (None if pd.isna(r) else r)
             for pid, r in zip(meta["patient_id"], meta["region_bl"])
         }
+        self._age_bl_of = dict(zip(meta["patient_id"], meta["age_bl"]))  # baseline age (years)
 
     def __getitem__(self, pid):
         i = self.start_pos[pid]
@@ -109,19 +110,32 @@ class HonicReader:
             out[i, uniq] = t[first_idx]
         return out
 
-    def resolve_prompt_age(self, pids, prompt_age):
-        """Fixed age in YEARS -> anchor in DAYS, dropping pids with no follow-up past it."""
-        anchor = np.full(len(pids), float(prompt_age) * DAYS_PER_YEAR, dtype=np.float32)
-        keep = ~np.isnan(anchor) & (self.exit_times(pids) > anchor)
-        return pids[keep], anchor[keep]
+    def resolve_prompt_age(self, at: float) -> dict:
+        """Per-participant forecast cutoff for `at` YEARS after each baseline.
+
+        cutoff_age (DAYS) = (age_bl + at) * 365.25. Returns {pid: cutoff_days} for
+        participants with follow-up past the cutoff (exit age > cutoff) -- i.e.
+        someone to forecast into; others are dropped. The dict keys define the
+        forecast cohort; pass it straight to Dataset(prompt_age=...)."""
+        pids = self._participants
+        age_bl = np.array([self._age_bl_of[p] for p in pids], dtype=np.float64)
+        cutoff = (age_bl + at) * DAYS_PER_YEAR  # (N,) days
+        keep = self.exit_times(pids) > cutoff
+        return {p: float(c) for p, c, k in zip(pids, cutoff, keep) if k}
 
 
 class Dataset:
-    """Builds the padded next-token batch a pretrained forward consumes.
+    """Builds the padded batch a pretrained forward consumes.
 
     Transforms are applied inline as functions (no Transform class). Matches
     delphi's eval config: no_event insertion ON, deterministic per-pid. Emits the
     slim token-only batch (X0, T0, X1, T1) -- honic's model.py takes no biomarkers.
+
+    Two modes for the (x0, x1) split in __getitem__:
+      * frozen-history (default): next-token shift x0=x[:-1], x1=x[1:].
+      * forecast (prompt_age set): x0/t0 = events up to each pid's cutoff (the
+        prompt), x1/t1 = the full trajectory (ground truth). prompt_age is a
+        {pid: cutoff_days} dict, e.g. from HonicReader.resolve_prompt_age.
     """
 
     def __init__(
@@ -134,6 +148,8 @@ class Dataset:
         blacklist_tokens: list | None = None,
         block_size: int | None = None,
         crop_mode: str = "right",
+        prompt_age: dict | None = None,
+        append_no_event_at_cutoff: bool = False,
         seed: int = 42,
         deterministic: bool = True,
     ):
@@ -145,6 +161,8 @@ class Dataset:
         self.blacklist_tokens = None if blacklist_tokens is None else np.asarray(blacklist_tokens)
         self.block_size = block_size
         self.crop_mode = crop_mode
+        self.prompt_age = prompt_age
+        self.append_no_event_at_cutoff = append_no_event_at_cutoff
         self.seed = seed
         self.deterministic = deterministic
         self._rng = np.random.default_rng(seed)
@@ -170,9 +188,19 @@ class Dataset:
         return x, t
 
     def __getitem__(self, idx: int):
-        x, t = self.reader[self.participants[idx]]
+        pid = self.participants[idx]
+        x, t = self.reader[pid]
         x, t = self._transform(x, t)
-        # next-token shift; .copy() so x0/x1 don't alias the same buffer
+        if self.prompt_age is not None:
+            # forecast: prompt = events up to the pid's cutoff; ground truth = full trajectory
+            cutoff = self.prompt_age[pid]
+            mask = t <= cutoff
+            x0, t0 = x[mask], t[mask]  # boolean-mask indexing already copies
+            if self.append_no_event_at_cutoff:
+                x0 = np.append(x0, NO_EVENT_TOKEN)
+                t0 = np.append(t0, np.float32(cutoff))
+            return x0, t0, x.copy(), t.copy()
+        # frozen-history next-token shift; .copy() so x0/x1 don't alias the same buffer
         x0, x1 = x[:-1].copy(), x[1:].copy()
         t0, t1 = t[:-1].copy(), t[1:].copy()
         return x0, t0, x1, t1
