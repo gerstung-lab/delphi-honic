@@ -68,6 +68,12 @@ def parse_args():
         help="crop each sequence to this many tokens (default: checkpoint's; 0 = no crop)",
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=128,
+        help="column-chunk the AUC ranking to cap memory (default 128: ~82 GB peak at 2M x 1300; 0 = no chunking)",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
     if not args.random_init and not args.ckpt:
@@ -168,6 +174,7 @@ def main():
     ctl_rates = ctl_rates.numpy()
     dis_rates = dis_rates.numpy()
     dis_times = dis_times.numpy()
+    del ctl_collator, dis_collator  # drop the per-batch lists finalize() kept alive (else ~2x memory)
     is_female = reader.is_female(pids)  # (N,) bool, aligned to the reordered rows
 
     # Region is just one more stratification dimension: a list of (label, row-mask)
@@ -185,7 +192,9 @@ def main():
     # the control binning. For a fixed (region, sex, age bin), one column-wise AUC
     # pass: controls = matching participants who never develop the token (their bin
     # control rate); cases = matching participants whose onset falls in this bin.
-    dis_time_bin = np.searchsorted(age_group_edges, dis_times, side="right") - 1  # (N, V)
+    # int16 (bins << 32767) not int64: at 2M patients this (N, V) matrix is ~5 GB vs ~20 GB
+    dis_time_bin = (np.searchsorted(age_group_edges, dis_times, side="right") - 1).astype(np.int16)  # (N, V)
+    del dis_times  # only needed for the binning above
     is_case = ~np.isnan(dis_rates)  # (N, V)
 
     results = {}
@@ -199,7 +208,8 @@ def main():
                 case_valid = is_case & (dis_time_bin == i) & is_gr
                 scores = np.where(case_valid, dis_rates, np.where(ctl_valid, ctl_score, np.nan))
                 results[(region, sex_label, i)] = batched_mann_whitney_auc(
-                    scores, ctl=ctl_valid, case=case_valid
+                    scores, ctl=ctl_valid, case=case_valid,
+                    chunk_size=(args.chunk_size if args.chunk_size > 0 else None),  # 0 -> no chunking
                 )
                 pbar.update(1)
     pbar.close()
