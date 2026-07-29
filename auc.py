@@ -189,6 +189,7 @@ def main():
     is_case = ~np.isnan(dis_rates)  # (N, V)
 
     results = {}
+    pbar = tqdm(total=len(region_groups) * 2 * n_bins, desc="AUC (region x sex x age bin)", leave=False)
     for region, is_r in region_groups:
         for sex_label, is_g in [("female", is_female), ("male", ~is_female)]:
             is_gr = (is_g & is_r)[:, None]
@@ -200,6 +201,8 @@ def main():
                 results[(region, sex_label, i)] = batched_mann_whitney_auc(
                     scores, ctl=ctl_valid, case=case_valid
                 )
+                pbar.update(1)
+    pbar.close()
 
     age_group_keys = [
         f"{int(start / DAYS_PER_YEAR)}-{int(end / DAYS_PER_YEAR)}"
