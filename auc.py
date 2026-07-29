@@ -151,9 +151,9 @@ def main():
 
     gen = torch.Generator(device=device).manual_seed(args.seed)
     ctl_collator = AgeStratRatesCollator(
-        age_groups=torch.from_numpy(age_group_edges).float().to(device), generator=gen
+        age_groups=torch.from_numpy(age_group_edges).float().to(device), n_participants=len(ds), generator=gen
     )
-    dis_collator = DiseaseRatesCollator(targets=targets)
+    dis_collator = DiseaseRatesCollator(targets=targets, n_participants=len(ds))
 
     with torch.no_grad():
         for batch_idx in tqdm(
@@ -192,9 +192,10 @@ def main():
     # the control binning. For a fixed (region, sex, age bin), one column-wise AUC
     # pass: controls = matching participants who never develop the token (their bin
     # control rate); cases = matching participants whose onset falls in this bin.
-    # int16 (bins << 32767) not int64: at 2M patients this (N, V) matrix is ~5 GB vs ~20 GB
-    dis_time_bin = (np.searchsorted(age_group_edges, dis_times, side="right") - 1).astype(np.int16)  # (N, V)
-    del dis_times  # only needed for the binning above
+    # Bin membership is compared inline against the two bin edges in the loop below
+    # (a transient (N, V) bool, freed each iteration) rather than materializing a full
+    # (N, V) dis_time_bin: np.searchsorted would build an int64 (N, V) temp (~21 GB at
+    # 2M x 1300, ~40 GB with the `- 1`) before we could downcast it.
     is_case = ~np.isnan(dis_rates)  # (N, V)
 
     results = {}
@@ -203,9 +204,11 @@ def main():
         for sex_label, is_g in [("female", is_female), ("male", ~is_female)]:
             is_gr = (is_g & is_r)[:, None]
             for i in range(n_bins):
+                lo, hi = age_group_edges[i], age_group_edges[i + 1]
                 ctl_score = ctl_rates[:, i, :]
                 ctl_valid = (~is_case) & ~np.isnan(ctl_score) & is_gr
-                case_valid = is_case & (dis_time_bin == i) & is_gr
+                # onset in bin i: edges[i] <= age < edges[i+1] (matches searchsorted side="right")
+                case_valid = is_case & (dis_times >= lo) & (dis_times < hi) & is_gr
                 scores = np.where(case_valid, dis_rates, np.where(ctl_valid, ctl_score, np.nan))
                 results[(region, sex_label, i)] = batched_mann_whitney_auc(
                     scores, ctl=ctl_valid, case=case_valid,

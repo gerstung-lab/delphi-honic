@@ -127,13 +127,44 @@ def sample_boolean_mask(mask: torch.Tensor, generator: torch.Generator | None = 
     return result
 
 
-class AgeStratRatesCollator:
+class _BufferedCollator:
+    """Shared accumulation: with n_participants, write each batch into a preallocated
+    (N, ...) CPU buffer at a running row offset -- no per-batch list and no
+    torch.concat at the end (concat transiently doubles memory: list + result). With
+    n_participants=None, fall back to appending + concat (old behaviour)."""
 
-    def __init__(self, age_groups: torch.Tensor, generator: torch.Generator | None = None):
+    def __init__(self, n_participants: int | None):
+        self.n = n_participants
+        self._rates = self._times = None
+        self._pos = 0
+        self._rate_list = list()
+        self._time_list = list()
+
+    def _store(self, rates: torch.Tensor, times: torch.Tensor):
+        if self.n is None:
+            self._rate_list.append(rates)
+            self._time_list.append(times)
+            return
+        if self._rates is None:  # preallocate once shapes are known -> no concat later
+            self._rates = torch.empty((self.n, *rates.shape[1:]), dtype=rates.dtype)
+            self._times = torch.empty((self.n, *times.shape[1:]), dtype=times.dtype)
+        b = rates.shape[0]
+        self._rates[self._pos : self._pos + b] = rates
+        self._times[self._pos : self._pos + b] = times
+        self._pos += b
+
+    def finalize(self):
+        if self.n is not None:
+            return self._rates[: self._pos], self._times[: self._pos]
+        return torch.concat(self._rate_list), torch.concat(self._time_list)
+
+
+class AgeStratRatesCollator(_BufferedCollator):
+
+    def __init__(self, age_groups: torch.Tensor, n_participants: int | None = None, generator: torch.Generator | None = None):
+        super().__init__(n_participants)
         self.age_groups = age_groups
         self.generator = generator
-        self.ctl_rates = list()
-        self.ctl_times = list()
 
     def step(self, timesteps: torch.Tensor, logits: torch.Tensor):
         batch_size = logits.shape[0]
@@ -159,20 +190,14 @@ class AgeStratRatesCollator:
             ctl_times.append(ctl_time)
         ctl_rates = torch.stack(ctl_rates, dim=1)
         ctl_times = torch.stack(ctl_times, dim=1)
-
-        self.ctl_rates.append(ctl_rates.detach().cpu())
-        self.ctl_times.append(ctl_times.detach().cpu())
-
-    def finalize(self):
-        return torch.concat(self.ctl_rates), torch.concat(self.ctl_times)
+        self._store(ctl_rates.detach().cpu(), ctl_times.detach().cpu())
 
 
-class DiseaseRatesCollator:
+class DiseaseRatesCollator(_BufferedCollator):
 
-    def __init__(self, targets: torch.Tensor):
+    def __init__(self, targets: torch.Tensor, n_participants: int | None = None):
+        super().__init__(n_participants)
         self.targets = targets
-        self.dis_rates = list()
-        self.dis_times = list()
 
     def step(self, tokens: torch.Tensor, timesteps: torch.Tensor, logits: torch.Tensor):
         dis_time = torch.full(
@@ -181,7 +206,6 @@ class DiseaseRatesCollator:
             fill_value=torch.nan,
         ).to(logits.device)
         dis_time.scatter_(index=tokens, src=timesteps, dim=1)
-        self.dis_times.append(dis_time.detach().cpu())
 
         dis_rate = torch.full(
             (logits.shape[0], logits.shape[-1]),
@@ -193,10 +217,8 @@ class DiseaseRatesCollator:
         for token in uniq_tokens:
             have_disease = tokens == token
             dis_rate[have_disease.any(dim=1), token] = logits[have_disease][:, token]
-        self.dis_rates.append(dis_rate.detach().cpu())
-
-    def finalize(self):
-        return torch.concat(self.dis_rates), torch.concat(self.dis_times)
+        # finalize() returns (rates, times) -> store in that order
+        self._store(dis_rate.detach().cpu(), dis_time.detach().cpu())
 
 
 # --------------------------------------------------------------------------- #
