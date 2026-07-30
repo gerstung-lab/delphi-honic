@@ -69,24 +69,65 @@ def parse_args():
     return args
 
 
-def reliability(p_ctl, p_case):
-    """Reliability points over PROB_BINS for one (token, [region,] sex, age bin).
+def _scatter(acc_n, acc_case, acc_psum, base, rate, valid, window, is_case):
+    """Bin one (chunk, age-bin) slice into flat (group, token, prob_bin) histograms.
 
-    Returns a list of (prob_bin_hi, pred, obs, count) for POPULATED bins only:
-    pred = mean predicted prob in bin, obs = observed case fraction, count = n.
-    Bins are right-closed (PROB_BINS[b-1], PROB_BINS[b]] (np.digitize right=True).
+    Only the `valid` cells are gathered before exp -- so we never build a full
+    (C, V) probability array (dense for controls, sparse for cases; one code path).
+    base: (C, V) int64 = (group*V + token)*N_PROB key without the prob-bin offset.
     """
-    p = np.concatenate([p_ctl, p_case])
-    y = np.concatenate([np.zeros(len(p_ctl)), np.ones(len(p_case))])
-    idx = np.digitize(p, PROB_BINS, right=True)
-    out = []
-    for b in range(1, len(PROB_BINS)):
-        m = idx == b
-        c = int(m.sum())
-        if c == 0:
-            continue  # drop empty bins (a reliability curve only has points where there's data)
-        out.append((float(PROB_BINS[b]), round(float(p[m].mean()), 6), round(float(y[m].mean()), 6), c))
-    return out
+    if not valid.any():
+        return
+    with np.errstate(over="ignore", invalid="ignore"):
+        pv = 1.0 - np.exp(-rate[valid].astype(np.float32) * window)  # 1-D, valid cells
+    keyv = base[valid] + np.digitize(pv, PROB_BINS, right=True)
+    flat_n, flat_case, flat_psum = acc_n.reshape(-1), acc_case.reshape(-1), acc_psum.reshape(-1)
+    m = flat_n.size
+    flat_n += np.bincount(keyv, minlength=m)
+    flat_psum += np.bincount(keyv, weights=pv, minlength=m)  # weights -> float64 sum
+    if is_case:
+        flat_case += np.bincount(keyv, minlength=m)
+
+
+def accumulate_reliability(ctl_rates, dis_rates, dis_times, group_id, n_groups,
+                           window, age_group_edges, chunk=None, progress=False):
+    """Reliability histograms over PROB_BINS, one participant-chunk at a time.
+
+    Replaces the per-(sex, token) column-gather loop: reads the big fp16 arrays in
+    row-contiguous chunks (sequential, cache- and swap-friendly) and upcasts only the
+    selected cells. Returns three (n_bins, n_groups, V, N_PROB) arrays -- count, case
+    count, summed predicted prob -- giving pred = psum/count and obs = case/count.
+    Semantics: control cell = not a case for that token AND a control was sampled in
+    the bin; case cell = a case whose onset falls in the bin. Bins are right-closed
+    (PROB_BINS[b-1], PROB_BINS[b]] via np.digitize(right=True); empty bins are dropped.
+    """
+    N, V = dis_rates.shape
+    n_bins = len(age_group_edges) - 1
+    n_prob = len(PROB_BINS) + 1  # np.digitize(., right=True) returns 0..len(PROB_BINS)
+    shape = (n_bins, n_groups, V, n_prob)
+    acc_n = np.zeros(shape, dtype=np.int64)
+    acc_case = np.zeros(shape, dtype=np.int64)
+    acc_psum = np.zeros(shape, dtype=np.float64)
+    col_key = (np.arange(V, dtype=np.int64) * n_prob)[None, :]  # (1, V)
+    if chunk is None:
+        chunk = max(1, 20_000_000 // V)  # ~2e7 cells/pass -> sub-GB peak
+    it = range(0, N, chunk)
+    if progress:
+        it = tqdm(it, total=int(np.ceil(N / chunk)), desc="chunks")
+    for r0 in it:
+        r1 = min(r0 + chunk, N)
+        base = (group_id[r0:r1] * V * n_prob)[:, None] + col_key  # (C, V) key sans prob bin
+        is_case_c = ~np.isnan(dis_rates[r0:r1])  # (C, V)
+        dis_c = dis_rates[r0:r1]                 # (C, V) fp16
+        dtimes_c = dis_times[r0:r1]              # (C, V)
+        for i in range(n_bins):
+            lo, hi = age_group_edges[i], age_group_edges[i + 1]
+            ctl_c = ctl_rates[r0:r1, i, :]  # (C, V) fp16 (contiguous last axis)
+            ctl_valid = (~is_case_c) & ~np.isnan(ctl_c)
+            case_valid = is_case_c & (dtimes_c >= lo) & (dtimes_c < hi)
+            _scatter(acc_n[i], acc_case[i], acc_psum[i], base, ctl_c, ctl_valid, window, is_case=False)
+            _scatter(acc_n[i], acc_case[i], acc_psum[i], base, dis_c, case_valid, window, is_case=True)
+    return acc_n, acc_case, acc_psum
 
 
 def main():
@@ -143,55 +184,59 @@ def main():
 
     ctl_rates, _ = ctl_collator.finalize()  # (N, n_bins, V) per-year rates
     dis_rates, dis_times = dis_collator.finalize()  # (N, V), (N, V)
-    # keep the big arrays float16 (as auc.py does) -- upcasting to float32 here would
-    # double a ~46GB (N, n_bins, V) array. The probability math below upcasts one
-    # (N, V) slice at a time instead, which is identical numerically but bounded.
-    ctl_rates = ctl_rates.numpy()  # float16
-    dis_rates = dis_rates.numpy()  # float16
-    dis_times = dis_times.numpy()
+    # keep the big arrays float16 (as auc.py does); accumulate_reliability walks them
+    # in row-contiguous chunks and upcasts only the selected cells to float32.
+    ctl_rates = ctl_rates.numpy()  # float16 (N, n_bins, V)
+    dis_rates = dis_rates.numpy()  # float16 (N, V)
+    dis_times = dis_times.numpy()  # (N, V)
     del ctl_collator, dis_collator
     is_female = reader.is_female(pids)
 
-    # region as an optional stratification dimension (see auc.py): a (label, mask)
-    # grouping list that collapses to one all-rows group when off.
+    # map every participant to one group id = region_idx * 2 + sex_id (0 female, 1
+    # male). --by-region off -> a single region, so the id is just the sex.
+    sex_id = np.where(is_female, 0, 1)
     if args.by_region:
         regions = np.array(["unknown" if r is None else str(r) for r in reader.region(pids)])
-        region_groups = [(r, regions == r) for r in sorted(set(regions.tolist()))]
+        region_labels = sorted(set(regions.tolist()))
+        region_of = {r: k for k, r in enumerate(region_labels)}
+        region_idx = np.array([region_of[r] for r in regions], dtype=np.int64)
     else:
-        region_groups = [(None, np.ones(len(pids), dtype=bool))]
+        region_labels = [None]
+        region_idx = np.zeros(len(pids), dtype=np.int64)
+    group_id = region_idx * 2 + sex_id
+    n_groups = 2 * len(region_labels)
 
-    is_case = ~np.isnan(dis_rates)  # (N, V)
+    acc_n, acc_case, acc_psum = accumulate_reliability(
+        ctl_rates, dis_rates, dis_times, group_id, n_groups, window, age_group_edges, progress=True
+    )
+
     age_group_keys = [
         f"{int(start / DAYS_PER_YEAR)}-{int(end / DAYS_PER_YEAR)}"
         for start, end in zip(age_group_edges[:-1], age_group_edges[1:])
     ]
-
     fieldnames = (
         ["token"] + (["region"] if args.by_region else []) + ["sex", "age_bin", "prob_bin_hi", "pred", "obs", "count"]
     )
     target_ids = targets.detach().cpu().numpy().tolist()
+    sexes = ["female", "male"]  # index == sex_id
     rows = []
-    for i, bracket in enumerate(tqdm(age_group_keys, desc="age bins")):
-        lo, hi = age_group_edges[i], age_group_edges[i + 1]  # bin i == [lo, hi) (matches searchsorted right)
-        ctl_i = ctl_rates[:, i, :]  # (N, V) fp16 VIEW (basic slice, no copy)
-        ctl_here = (~is_case) & ~np.isnan(ctl_i)  # (N, V)
-        case_here = is_case & (dis_times >= lo) & (dis_times < hi)  # (N, V)
-        for region, is_r in region_groups:
-            for sex_label, is_g in [("female", is_female), ("male", ~is_female)]:
-                grp = is_g & is_r
+    for i, bracket in enumerate(age_group_keys):
+        for region_k, region in enumerate(region_labels):
+            for sex_k, sex_label in enumerate(sexes):
+                g = region_k * 2 + sex_k
                 for d in target_ids:
+                    cnt, csum, kcase = acc_n[i, g, d], acc_psum[i, g, d], acc_case[i, g, d]  # (N_PROB,) each
                     token = reader.detokenizer.get(int(d), str(d))
-                    cmask = ctl_here[:, d] & grp
-                    kmask = case_here[:, d] & grp
-                    # rate -> prob on the SELECTED rows only; never a full (N, V) float array
-                    # (that is what auc.py avoids and what was OOMing before/inside this loop).
-                    with np.errstate(over="ignore", invalid="ignore"):
-                        p_ctl = 1.0 - np.exp(-ctl_i[cmask, d].astype(np.float32) * window)
-                        p_case = 1.0 - np.exp(-dis_rates[kmask, d].astype(np.float32) * window)
-                    for prob_hi, pred, obs, count in reliability(p_ctl, p_case):
+                    for b in range(1, len(PROB_BINS)):  # populated bins only (b in 1..len-1)
+                        c = int(cnt[b])
+                        if c == 0:
+                            continue
                         row = {
                             "token": token, "sex": sex_label, "age_bin": bracket,
-                            "prob_bin_hi": prob_hi, "pred": pred, "obs": obs, "count": count,
+                            "prob_bin_hi": float(PROB_BINS[b]),
+                            "pred": round(float(csum[b] / c), 6),
+                            "obs": round(float(kcase[b] / c), 6),
+                            "count": c,
                         }
                         if args.by_region:
                             row["region"] = region
