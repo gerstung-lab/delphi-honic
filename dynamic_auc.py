@@ -115,9 +115,16 @@ def main():
     case_times = (torch.from_numpy(onset).to(device) - offset_days)  # (N, V) onset - offset
 
     # --- Phase 2: concordance ---
+    # covariates to control for: a control must match the case on each. Sex and region
+    # are the same kind of constraint -- just entries in the list.
+    covariates = []
+    if args.same_sex:
+        covariates.append(is_female.long())
+    if args.by_region:
+        covariates.append(region_codes)
     cc = ConcordanceCollator(
-        dis_rates=dis_rates, case_times=case_times, is_female=is_female, region_codes=region_codes,
-        chunk_size=args.chunk_size, max_gap_days=args.max_gap * DAYS_PER_YEAR, same_sex_only=args.same_sex,
+        dis_rates=dis_rates, case_times=case_times, covariates=covariates or None,
+        chunk_size=args.chunk_size, max_gap_days=args.max_gap * DAYS_PER_YEAR,
     )
     del dis_rates, case_times  # the collator kept its own copies
     with torch.no_grad():
@@ -126,9 +133,10 @@ def main():
             logits, _, _ = model(x0, t0)
             cc.step(x0, t0, logits)
 
-    case_sex, case_tokens, total_pairs, concordant = cc.finalize()
+    case_tokens, total_pairs, concordant = cc.finalize()
     case_time = cc.case_times.cpu().numpy()
     case_part = cc.case_participants.cpu().numpy()
+    case_sex = is_female.cpu().numpy()  # per-participant sex, indexed by case_part below
 
     fieldnames = ["token"] + (["region"] if args.by_region else []) + ["sex", "participant_id", "case_time", "concordant", "total_pairs"]
     rows = []
@@ -136,7 +144,7 @@ def main():
         p = int(case_part[k])
         row = {
             "token": reader.detokenizer.get(int(case_tokens[k]), str(case_tokens[k])),
-            "sex": "female" if case_sex[k] else "male",
+            "sex": "female" if case_sex[p] else "male",
             "participant_id": pids[p],
             "case_time": round(float(case_time[k]), 2),
             "concordant": float(concordant[k]),

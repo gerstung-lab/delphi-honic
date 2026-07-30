@@ -326,20 +326,19 @@ class ConcordanceCollator:
 
     A case event = each (participant, disease) pair the participant develops, with its
     frozen-history score (case_scores) and onset age (case_times). For each case, over
-    every control batch, it counts at-risk same-sex (and same-region, if given) controls
-    whose model score for the case's disease AT THE CASE'S ONSET AGE is below the case's
-    score. Accumulates concordant/total pairs per case event; c-index = sum/sum.
+    every control batch, it counts at-risk controls -- matched to the case on every
+    `covariates` code (e.g. sex, region) -- whose model score for the case's disease AT
+    THE CASE'S ONSET AGE is below the case's score. Accumulates concordant/total pairs
+    per case event; c-index = sum/sum.
     """
 
     def __init__(
         self,
         dis_rates: torch.Tensor,  # (N, V) case scores; NaN where not a case
         case_times: torch.Tensor,  # (N, V) onset-age matrix (days), NaN if never
-        is_female: torch.Tensor,  # (N,) bool
-        region_codes: torch.Tensor | None = None,  # (N,) int, or None for no region constraint
+        covariates: list[torch.Tensor] | None = None,  # (N,) code tensors; a control must MATCH the case on each
         chunk_size: int = 8192,
         max_gap_days: float = 5 * 365.25,
-        same_sex_only: bool = True,
     ):
         cp, ct = (~torch.isnan(dis_rates)).nonzero(as_tuple=True)  # flatten case events
         self.case_scores = dis_rates[cp, ct].float()
@@ -347,12 +346,9 @@ class ConcordanceCollator:
         self.case_times = case_times[cp, ct].float()
         self.case_tokens = ct
         self.case_participants = cp
-        self.is_female = is_female
-        self.region_codes = region_codes
-        self.case_sex = is_female[cp].cpu().numpy()
+        self.covariates = covariates or []  # controls matched to the case on each (sex, region, ...)
         self.chunk_size = chunk_size
         self.max_gap_days = max_gap_days
-        self.same_sex_only = same_sex_only
         E = len(cp)
         self.concordant_pairs = np.zeros(E, dtype=np.float64)
         self.total_pairs = np.zeros(E, dtype=np.float64)
@@ -378,13 +374,11 @@ class ConcordanceCollator:
             j_onset = self.case_times_mat[j.unsqueeze(1), ctok.unsqueeze(0).expand(B, -1)]
             valid &= j_onset.isnan() | (j_onset > cct.unsqueeze(0))  # at-risk: control has not developed it yet
             valid &= j.unsqueeze(1) != cpart.unsqueeze(0)  # not the case itself
-            if self.same_sex_only:
-                valid &= self.is_female[j].unsqueeze(1) == self.is_female[cpart].unsqueeze(0)
-            if self.region_codes is not None:
-                valid &= self.region_codes[j].unsqueeze(1) == self.region_codes[cpart].unsqueeze(0)
+            for cov in self.covariates:  # control must match the case on every covariate (sex, region, ...)
+                valid &= cov[j].unsqueeze(1) == cov[cpart].unsqueeze(0)
             self.concordant_pairs[s:e] += (valid & (ctrl.float() < cscore.unsqueeze(0))).sum(0).cpu().numpy()
             self.total_pairs[s:e] += valid.sum(0).cpu().numpy()
         self.participant_offset += B
 
     def finalize(self):
-        return self.case_sex, self.case_tokens.cpu().numpy(), self.total_pairs, self.concordant_pairs
+        return self.case_tokens.cpu().numpy(), self.total_pairs, self.concordant_pairs
