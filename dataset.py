@@ -103,11 +103,23 @@ class HonicReader:
         Width is max token id + 1 (== vocab_size for a dense id space) so a token id
         indexes its own column even if the id space is not 0..N-1 contiguous."""
         width = max(self.tokenizer.values()) + 1
-        out = np.full((len(pids), width), np.nan, dtype=np.float32)
-        for i, pid in enumerate(pids):
-            x, t = self[pid]
-            uniq, first_idx = np.unique(x, return_index=True)  # x is time-ordered -> earliest per token
-            out[i, uniq] = t[first_idx]
+        # Vectorized: gather every requested pid's contiguous event block into flat
+        # arrays, then ONE global np.unique(return_index) picks each (row, token) cell's
+        # first occurrence (streams are age-ascending). Replaces a per-participant Python
+        # loop + per-participant sort -- ~2M iterations at full cohort -> a few array ops.
+        n = len(pids)
+        starts = np.fromiter((self.start_pos[p] for p in pids), dtype=np.int64, count=n)
+        lens = np.fromiter((self.seq_len[p] for p in pids), dtype=np.int64, count=n)
+        total = int(lens.sum())
+        row = np.repeat(np.arange(n, dtype=np.int64), lens)
+        within = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(lens) - lens, lens)  # 0..len-1 per block
+        pos = np.repeat(starts, lens) + within  # global positions into the flat token/time arrays
+        tok = self.tokens[pos].astype(np.int64)
+        assert tok.max(initial=-1) < width, "token id >= width: event_times column overflow"
+        key = row * width + tok  # flat (row, token) cell id
+        cell, first = np.unique(key, return_index=True)  # first index per cell = earliest event (age-ascending)
+        out = np.full((n, width), np.nan, dtype=np.float32)
+        out.flat[cell] = self.timesteps[pos][first]
         return out
 
     def resolve_prompt_age(self, at: float) -> dict:
