@@ -98,15 +98,15 @@ class HonicReader:
             out[i] = self.timesteps[self.start_pos[pid] + self.seq_len[pid] - 1]
         return out
 
-    def event_times(self, pids) -> np.ndarray:
-        """(N, max_id+1) first-occurrence age in DAYS per token; NaN where absent.
-        Width is max token id + 1 (== vocab_size for a dense id space) so a token id
-        indexes its own column even if the id space is not 0..N-1 contiguous."""
+    def event_times_sparse(self, pids):
+        """Sparse first-occurrences: (row, tok, onset) 1D arrays, one entry per
+        (participant, distinct token), SORTED by key = row*width + tok. The non-NaN
+        support of event_times() WITHOUT materializing the dense (N, V) matrix -- for
+        callers that only need the sparse events plus a keyed (participant, token) ->
+        onset lookup (dynamic_auc's concordance). Vectorized: gather every pid's
+        contiguous event block into flat arrays, then ONE global np.unique(return_index)
+        picks each cell's first occurrence (streams are age-ascending)."""
         width = max(self.tokenizer.values()) + 1
-        # Vectorized: gather every requested pid's contiguous event block into flat
-        # arrays, then ONE global np.unique(return_index) picks each (row, token) cell's
-        # first occurrence (streams are age-ascending). Replaces a per-participant Python
-        # loop + per-participant sort -- ~2M iterations at full cohort -> a few array ops.
         n = len(pids)
         starts = np.fromiter((self.start_pos[p] for p in pids), dtype=np.int64, count=n)
         lens = np.fromiter((self.seq_len[p] for p in pids), dtype=np.int64, count=n)
@@ -116,10 +116,17 @@ class HonicReader:
         pos = np.repeat(starts, lens) + within  # global positions into the flat token/time arrays
         tok = self.tokens[pos].astype(np.int64)
         assert tok.max(initial=-1) < width, "token id >= width: event_times column overflow"
-        key = row * width + tok  # flat (row, token) cell id
-        cell, first = np.unique(key, return_index=True)  # first index per cell = earliest event (age-ascending)
-        out = np.full((n, width), np.nan, dtype=np.float32)
-        out.flat[cell] = self.timesteps[pos][first]
+        cell, first = np.unique(row * width + tok, return_index=True)  # sorted unique (row, token) cells
+        return cell // width, cell % width, self.timesteps[pos][first]
+
+    def event_times(self, pids) -> np.ndarray:
+        """(N, max_id+1) first-occurrence age in DAYS per token; NaN where absent.
+        Width is max token id + 1 (== vocab_size for a dense id space) so a token id
+        indexes its own column even if the id space is not 0..N-1 contiguous."""
+        width = max(self.tokenizer.values()) + 1
+        row, tok, onset = self.event_times_sparse(pids)
+        out = np.full((len(pids), width), np.nan, dtype=np.float32)
+        out[row, tok] = onset  # unique (row, token) cells -> no duplicate scatter
         return out
 
     def resolve_prompt_age(self, at: float) -> dict:

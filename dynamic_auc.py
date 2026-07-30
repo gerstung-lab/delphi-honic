@@ -31,7 +31,7 @@ from tqdm import tqdm
 
 from auc import load_model
 from dataset import DAYS_PER_YEAR, Dataset, HonicReader
-from eval import ConcordanceCollator, DiseaseRatesCollator, eval_iter, nearest_prediction
+from eval import CaseScoreCollator, ConcordanceCollator, eval_iter, nearest_prediction
 
 NO_EVENT_TOKEN = 1
 
@@ -95,25 +95,32 @@ def main():
 
     offset_days = args.offset * DAYS_PER_YEAR
 
-    # --- Phase 1: case scores (the model's rate just before each event) ---
-    dis_collator = DiseaseRatesCollator(targets=targets, n_participants=len(ds))
+    # --- Phase 1: case scores as sparse 1D events (no dense (N, V)) ---
+    case_collator = CaseScoreCollator(targets=targets)
     with torch.no_grad():
         for batch_idx in tqdm(eval_iter(len(ds), args.batch_size), total=int(np.ceil(len(ds) / args.batch_size)), desc="Phase 1", leave=False):
             x0, t0, x1, t1 = (b.to(device) for b in ds.get_batch(batch_idx))
             scores, nearest_t0, _ = _forward_scores(model, x0, t0, x1, t1, offset_days, termination_token=reader.death_token)
-            dis_collator.step(tokens=x1, timesteps=nearest_t0, logits=scores)
-    dis_rates, _ = dis_collator.finalize()  # (N, V) case scores, NaN where not a case
-    del dis_collator
+            case_collator.step(tokens=x1, logits=scores)
+    case_part, case_tok, case_score = (t.to(device) for t in case_collator.finalize())  # (E,) each
+    del case_collator
 
-    # onset ages + strata, aligned to the reordered rows
-    onset = reader.event_times(pids)  # (N, V) first-occurrence age (days), NaN if never
+    # Sparse first-occurrence onsets for ALL participant-token events, for the at-risk
+    # lookup: key = participant*width + token (sorted), val = onset - offset. Replaces the
+    # dense (N, V) onset/case_times matrices that pushed the host into swap between phases.
+    width = max(reader.tokenizer.values()) + 1
+    o_row, o_tok, o_onset = reader.event_times_sparse(pids)
+    onset_key = torch.from_numpy(o_row * width + o_tok).to(device)  # (M,) sorted int64
+    onset_val = torch.from_numpy(o_onset).to(device) - offset_days  # (M,) onset - offset
+    # each case event's own onset (= onset - offset), via the same keyed lookup
+    qk = case_part * width + case_tok
+    case_time = onset_val[torch.searchsorted(onset_key, qk).clamp(max=onset_key.numel() - 1)]  # (E,)
+
+    # strata, aligned to the reordered rows
     last_t = torch.from_numpy(reader.exit_times(pids)).to(device)  # (N,) follow-up end age (days)
     is_female = torch.from_numpy(reader.is_female(pids)).to(device)
     regions = np.array(["unknown" if r is None else str(r) for r in reader.region(pids)]) if args.by_region else None
     region_codes = torch.from_numpy(np.unique(regions, return_inverse=True)[1]).to(device) if args.by_region else None
-
-    dis_rates = dis_rates.to(device)
-    case_times = (torch.from_numpy(onset).to(device) - offset_days)  # (N, V) onset - offset
 
     # --- Phase 2: concordance ---
     # covariates to control for: a control must match the case on each. Sex and region
@@ -124,10 +131,10 @@ def main():
     if args.by_region:
         covariates.append(region_codes)
     cc = ConcordanceCollator(
-        dis_rates=dis_rates, case_times=case_times, last_t=last_t, covariates=covariates or None,
+        case_participants=case_part, case_tokens=case_tok, case_scores=case_score, case_times=case_time,
+        onset_key=onset_key, onset_val=onset_val, width=width, last_t=last_t, covariates=covariates or None,
         chunk_size=args.chunk_size, max_lag=args.max_lag * DAYS_PER_YEAR, termination_token=reader.death_token,
     )
-    del dis_rates, case_times  # the collator kept its own copies
     with torch.no_grad():
         for batch_idx in tqdm(eval_iter(len(ds), args.batch_size), total=int(np.ceil(len(ds) / args.batch_size)), desc="Phase 2", leave=False):
             x0, t0, _, _ = (b.to(device) for b in ds.get_batch(batch_idx))

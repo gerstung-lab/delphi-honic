@@ -211,6 +211,38 @@ class DiseaseRatesCollator(_BufferedCollator):
         self._store(dis_rate.detach().cpu(), dis_time.detach().cpu())
 
 
+class CaseScoreCollator:
+    """Sparse sibling of DiseaseRatesCollator for concordance (dynamic_auc): collects each
+    case event's score as 1-D tensors of length E (total case events) instead of a dense
+    (N, V) matrix. A case event = a (participant, target token) pair the participant
+    develops; the score is the model's rate just before it. Per batch it builds only a
+    tiny (B, V) scratch, extracts the non-NaN cells, and appends them with a GLOBAL
+    participant index. finalize() -> (participants, tokens, scores), each (E,)."""
+
+    def __init__(self, targets: torch.Tensor):
+        self.targets = targets
+        self._p, self._t, self._s = [], [], []
+        self._offset = 0  # running global participant index (batches are consecutive pids)
+
+    def step(self, tokens: torch.Tensor, logits: torch.Tensor):
+        # tokens: (B, L) trajectory token ids; logits: (B, L, V) per-position scores.
+        b, v = tokens.shape[0], logits.shape[-1]
+        rate = torch.full((b, v), float("nan"), dtype=logits.dtype, device=logits.device)  # match logits dtype (may be fp16)
+        uniq = torch.unique(tokens)
+        uniq = uniq[torch.isin(uniq, self.targets)]
+        for token in uniq:  # match DiseaseRatesCollator: score at the token's position (last wins on repeats)
+            have = tokens == token
+            rate[have.any(dim=1), token] = logits[have][:, token]
+        p, t = (~torch.isnan(rate)).nonzero(as_tuple=True)  # sparse case cells (local participant, token)
+        self._p.append((p + self._offset).cpu())
+        self._t.append(t.cpu())
+        self._s.append(rate[p, t].float().cpu())
+        self._offset += b
+
+    def finalize(self):
+        return torch.cat(self._p), torch.cat(self._t), torch.cat(self._s)
+
+
 # --------------------------------------------------------------------------- #
 # legacy-model intensity bridge
 # --------------------------------------------------------------------------- #
@@ -343,32 +375,35 @@ class ConcordanceCollator:
 
     def __init__(
         self,
-        dis_rates: torch.Tensor,  # (N, V) case scores; NaN where not a case
-        case_times: torch.Tensor,  # (N, V) onset-age matrix (days), NaN if never
+        case_participants: torch.Tensor,  # (E,) global participant index (pids order)
+        case_tokens: torch.Tensor,  # (E,) case token id
+        case_scores: torch.Tensor,  # (E,) model score just before the event
+        case_times: torch.Tensor,  # (E,) case onset age - offset (days)
+        onset_key: torch.Tensor,  # (M,) SORTED int64 = participant*width + token, ALL first-occurrences
+        onset_val: torch.Tensor,  # (M,) onset age - offset (days), aligned to onset_key
+        width: int,  # token-dim stride the keys were built with
         last_t: torch.Tensor,  # (N,) each participant's last recorded age (days); the follow-up end
         covariates: list[torch.Tensor] | None = None,  # (N,) code tensors; a control must MATCH the case on each
         chunk_size: int = 8192,
         max_lag: float = 365.25,  # days (1 year)
         termination_token: int | None = None,  # death: controls read after it -> NaN -> dropped
     ):
-        # flatten case events; chunk rows so no nonzero() call exceeds INT_MAX elements
-        mask = ~torch.isnan(dis_rates)
-        step = max(1, (2**31 - 1) // dis_rates.shape[1])
-        idx = [(r + s, c) for s in range(0, dis_rates.shape[0], step)
-               for r, c in [mask[s:s + step].nonzero(as_tuple=True)]]
-        cp = torch.cat([r for r, _ in idx])
-        ct = torch.cat([c for _, c in idx])
-        self.case_scores = dis_rates[cp, ct].float()
-        self.case_times_mat = case_times  # (N, V) onset matrix (for the at-risk check)
-        self.case_times = case_times[cp, ct].float()
-        self.case_tokens = ct
-        self.case_participants = cp
+        # case events + onset lookup arrive sparse (no dense (N, V)); the at-risk check
+        # `did control j develop the case's token, and when` is a keyed searchsorted into
+        # (onset_key, onset_val) instead of a dense case_times_mat[j, token] gather.
+        self.case_participants = case_participants
+        self.case_tokens = case_tokens
+        self.case_scores = case_scores.float()
+        self.case_times = case_times.float()
+        self.onset_key = onset_key
+        self.onset_val = onset_val
+        self.width = width
         self.last_t = last_t
         self.covariates = covariates or []  # controls matched to the case on each (sex, region, ...)
         self.chunk_size = chunk_size
         self.max_lag = max_lag
         self.termination_token = termination_token
-        E = len(cp)
+        E = len(case_tokens)
         self.concordant_pairs = np.zeros(E, dtype=np.float64)
         self.total_pairs = np.zeros(E, dtype=np.float64)
         self.participant_offset = 0
@@ -394,7 +429,14 @@ class ConcordanceCollator:
             # drop controls whose last record ended > max_lag before the case onset (stale / not
             # observed near the case time). last_t[j] is the control's follow-up end.
             valid &= (cct.unsqueeze(0) - self.last_t[j].unsqueeze(1)) <= self.max_lag
-            j_onset = self.case_times_mat[j.unsqueeze(1), ctok.unsqueeze(0).expand(B, -1)]
+            # control j's own onset of the case's token (NaN if never) -- sparse keyed lookup
+            # replacing a dense case_times_mat[j, ctok] gather.
+            qk = j.unsqueeze(1) * self.width + ctok.unsqueeze(0)  # (B, E_c) int64 keys
+            loc = torch.searchsorted(self.onset_key, qk).clamp(max=self.onset_key.numel() - 1)
+            j_onset = torch.where(
+                self.onset_key[loc] == qk, self.onset_val[loc],
+                torch.tensor(float("nan"), device=self.device, dtype=self.onset_val.dtype),
+            )
             valid &= j_onset.isnan() | (j_onset > cct.unsqueeze(0))  # at-risk: control has not developed it yet
             valid &= j.unsqueeze(1) != cpart.unsqueeze(0)  # not the case itself
             for cov in self.covariates:  # control must match the case on every covariate (sex, region, ...)
