@@ -79,8 +79,10 @@ def main():
         pids = pids[np.sort(np.random.default_rng(args.seed).choice(len(pids), size=args.subsample, replace=False))]
 
     # forecast mode: x0/t0 = prompt (events up to the cutoff). append_no_event=False
-    # for hazards (the last real prompt position is the risk-read anchor).
-    ds = Dataset(reader, pids, prompt_age=prompt_age, block_size=block_size, seed=args.seed)
+    # for hazards (the last real prompt position is the risk-read anchor). crop_mode=left:
+    # a block-size crop keeps the EARLIEST tokens, so it never strips the pre-cutoff
+    # history the prompt is built from (right crop drops it -> empty prompt -> (B,0) crash).
+    ds = Dataset(reader, pids, prompt_age=prompt_age, block_size=block_size, crop_mode="left", seed=args.seed)
     pids = ds.sort_by_length(descending=True)  # rebind to the batched row order
 
     # hazards predictor: the model's logits at the last prompt position (left-padded,
