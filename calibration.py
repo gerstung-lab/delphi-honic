@@ -131,9 +131,12 @@ def main():
         ):
             x0, t0, x1, t1 = (b.to(device) for b in ds.get_batch(batch_idx))
             logits, _, _ = model(x0, t0)  # legacy interface
-            scores, nearest_t0 = nearest_prediction(x0, t0, logits, t1 - offset_days)
-            # legacy logit -> per-day rate exp(logit) -> per-year rate; occurred -> 0, invalid -> NaN.
-            # half-overflow on huge rates saturates to +inf -> prob 1 downstream (the correct limit).
+            # termination_token: reads past death -> NaN (death is last under the default
+            # no_event config, so this only bites a negative --offset).
+            scores, nearest_t0 = nearest_prediction(x0, t0, logits, t1 - offset_days, termination_token=reader.death_token)
+            # legacy logit -> per-day rate exp(logit) -> per-year rate; occurred -> 0,
+            # invalid/post-death -> NaN. half-overflow on huge rates saturates to +inf ->
+            # prob 1 downstream (the correct limit).
             rate = (scores.float().exp() * DAYS_PER_YEAR).half()
             ctl_collator.step(timesteps=nearest_t0, logits=rate)
             dis_collator.step(tokens=x1, timesteps=nearest_t0, logits=rate)
