@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument("--out", required=True, help="output CSV path")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--offset", type=float, default=0.0, help="forecast offset in YEARS (score at onset - offset)")
-    p.add_argument("--max-gap", type=float, default=5.0, help="control read must be within this many YEARS of the case onset")
+    p.add_argument("--max-lag", type=float, default=1.0, help="drop controls whose last record is more than this many YEARS before the case onset")
     p.add_argument("--same-sex", action=argparse.BooleanOptionalAction, default=True, help="restrict controls to the case's sex")
     p.add_argument("--chunk-size", type=int, default=8192, help="case-event chunk size for the concordance inner loop")
     p.add_argument("--block-size", type=int, default=None, help="crop each sequence to this many tokens (default: checkpoint's; 0 = no crop)")
@@ -107,6 +107,7 @@ def main():
 
     # onset ages + strata, aligned to the reordered rows
     onset = reader.event_times(pids)  # (N, V) first-occurrence age (days), NaN if never
+    last_t = torch.from_numpy(reader.exit_times(pids)).to(device)  # (N,) follow-up end age (days)
     is_female = torch.from_numpy(reader.is_female(pids)).to(device)
     regions = np.array(["unknown" if r is None else str(r) for r in reader.region(pids)]) if args.by_region else None
     region_codes = torch.from_numpy(np.unique(regions, return_inverse=True)[1]).to(device) if args.by_region else None
@@ -123,8 +124,8 @@ def main():
     if args.by_region:
         covariates.append(region_codes)
     cc = ConcordanceCollator(
-        dis_rates=dis_rates, case_times=case_times, covariates=covariates or None,
-        chunk_size=args.chunk_size, max_gap_days=args.max_gap * DAYS_PER_YEAR,
+        dis_rates=dis_rates, case_times=case_times, last_t=last_t, covariates=covariates or None,
+        chunk_size=args.chunk_size, max_lag=args.max_lag * DAYS_PER_YEAR,
     )
     del dis_rates, case_times  # the collator kept its own copies
     with torch.no_grad():

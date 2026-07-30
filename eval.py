@@ -336,9 +336,10 @@ class ConcordanceCollator:
         self,
         dis_rates: torch.Tensor,  # (N, V) case scores; NaN where not a case
         case_times: torch.Tensor,  # (N, V) onset-age matrix (days), NaN if never
+        last_t: torch.Tensor,  # (N,) each participant's last recorded age (days); the follow-up end
         covariates: list[torch.Tensor] | None = None,  # (N,) code tensors; a control must MATCH the case on each
         chunk_size: int = 8192,
-        max_gap_days: float = 5 * 365.25,
+        max_lag: float = 365.25,  # days (1 year)
     ):
         cp, ct = (~torch.isnan(dis_rates)).nonzero(as_tuple=True)  # flatten case events
         self.case_scores = dis_rates[cp, ct].float()
@@ -346,9 +347,10 @@ class ConcordanceCollator:
         self.case_times = case_times[cp, ct].float()
         self.case_tokens = ct
         self.case_participants = cp
+        self.last_t = last_t
         self.covariates = covariates or []  # controls matched to the case on each (sex, region, ...)
         self.chunk_size = chunk_size
-        self.max_gap_days = max_gap_days
+        self.max_lag = max_lag
         E = len(cp)
         self.concordant_pairs = np.zeros(E, dtype=np.float64)
         self.total_pairs = np.zeros(E, dtype=np.float64)
@@ -370,7 +372,9 @@ class ConcordanceCollator:
             ctrl, t_at = nearest_prediction_at(x0, t0, logits, cct.unsqueeze(0).expand(B, -1), ctok)  # (B, E_c)
             valid = t_at >= 0  # has strict-before history (not padding)
             valid &= ~torch.isnan(ctrl)  # no history / occurred-NaN controls drop out
-            valid &= (cct.unsqueeze(0) - t_at) < self.max_gap_days  # read within max_gap of onset
+            # drop controls whose last record ended > max_lag before the case onset (stale / not
+            # observed near the case time). last_t[j] is the control's follow-up end.
+            valid &= (cct.unsqueeze(0) - self.last_t[j].unsqueeze(1)) <= self.max_lag
             j_onset = self.case_times_mat[j.unsqueeze(1), ctok.unsqueeze(0).expand(B, -1)]
             valid &= j_onset.isnan() | (j_onset > cct.unsqueeze(0))  # at-risk: control has not developed it yet
             valid &= j.unsqueeze(1) != cpart.unsqueeze(0)  # not the case itself
