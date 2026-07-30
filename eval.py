@@ -259,6 +259,7 @@ def nearest_prediction(
     logits: torch.Tensor,
     query_t: torch.Tensor,
     terminate_except=DEFAULT_TERMINATE_EXCEPT,
+    termination_token: int | None = None,
 ):
     """Legacy-model stand-in for model.intensity().
 
@@ -278,6 +279,8 @@ def nearest_prediction(
                    already occurred by that position -> -inf (rank lowest / rate 0),
                    queries with no strict-before history -> NaN (excluded downstream).
         nearest_t: (B, Q) age of that input step (-1e4 where invalid).
+    termination_token: if given, positions whose history already includes this token
+        (e.g. death) -> the whole prediction is NaN (the model never saw tokens after it).
     Rank-identical to exp'd intensities since AUC is rank-based.
     """
     V = logits.shape[-1]
@@ -287,6 +290,8 @@ def nearest_prediction(
         have_occurred(x0, terminate_except, V), idx.unsqueeze(-1), dim=1
     )  # (B, Q, V)
     scores = scores.masked_fill(occurred, float("-inf"))
+    if termination_token is not None:  # after death: no valid prediction
+        scores = scores.masked_fill(occurred[..., termination_token].unsqueeze(-1), float("nan"))
     scores = scores.masked_fill(invalid.unsqueeze(-1), float("nan"))
     return scores, nearest_t
 
@@ -298,6 +303,7 @@ def nearest_prediction_at(
     query_t: torch.Tensor,
     tokens: torch.Tensor,
     terminate_except=DEFAULT_TERMINATE_EXCEPT,
+    termination_token: int | None = None,
 ):
     """Per-(query, token) nearest_prediction: the legacy model's logit for a specific
     token at the input step strictly before each query time -- avoids the (B, Q, V)
@@ -305,16 +311,19 @@ def nearest_prediction_at(
 
     x0, t0: (B, L0); logits: (B, L0, V); query_t: (B, Q); tokens: (Q,) or (B, Q).
     Returns (scores (B, Q), nearest_t (B, Q)): the token's logit, -inf if already
-    occurred by that step, NaN if there is no strict-before history.
+    occurred by that step, NaN if there is no strict-before history. termination_token:
+    if given, reads whose history already includes it (death) -> NaN (post-termination).
     """
     V = logits.shape[-1]
     idx, nearest_t, invalid = lookup(t0, query_t)  # (B, Q)
     B, Q = idx.shape
     tok = torch.broadcast_to(tokens, idx.shape)
     b = torch.arange(B, device=logits.device).unsqueeze(1).expand(B, Q)
+    occ = have_occurred(x0, terminate_except, V)  # (B, L0, V)
     scores = logits[b, idx, tok]  # (B, Q)
-    occurred = have_occurred(x0, terminate_except, V)[b, idx, tok]  # (B, Q)
-    scores = scores.masked_fill(occurred, float("-inf"))
+    scores = scores.masked_fill(occ[b, idx, tok], float("-inf"))  # token already occurred
+    if termination_token is not None:
+        scores = scores.masked_fill(occ[b, idx, termination_token], float("nan"))  # after death
     scores = scores.masked_fill(invalid, float("nan"))
     return scores, nearest_t
 
@@ -340,6 +349,7 @@ class ConcordanceCollator:
         covariates: list[torch.Tensor] | None = None,  # (N,) code tensors; a control must MATCH the case on each
         chunk_size: int = 8192,
         max_lag: float = 365.25,  # days (1 year)
+        termination_token: int | None = None,  # death: controls read after it -> NaN -> dropped
     ):
         cp, ct = (~torch.isnan(dis_rates)).nonzero(as_tuple=True)  # flatten case events
         self.case_scores = dis_rates[cp, ct].float()
@@ -351,6 +361,7 @@ class ConcordanceCollator:
         self.covariates = covariates or []  # controls matched to the case on each (sex, region, ...)
         self.chunk_size = chunk_size
         self.max_lag = max_lag
+        self.termination_token = termination_token
         E = len(cp)
         self.concordant_pairs = np.zeros(E, dtype=np.float64)
         self.total_pairs = np.zeros(E, dtype=np.float64)
@@ -369,7 +380,9 @@ class ConcordanceCollator:
             cpart = self.case_participants[s:e]
             cscore = self.case_scores[s:e]
             # legacy: control's rate for the case's token at the case's onset age
-            ctrl, t_at = nearest_prediction_at(x0, t0, logits, cct.unsqueeze(0).expand(B, -1), ctok)  # (B, E_c)
+            ctrl, t_at = nearest_prediction_at(
+                x0, t0, logits, cct.unsqueeze(0).expand(B, -1), ctok, termination_token=self.termination_token
+            )  # (B, E_c); dead controls (read after death) -> NaN -> dropped below
             valid = t_at >= 0  # has strict-before history (not padding)
             valid &= ~torch.isnan(ctrl)  # no history / occurred-NaN controls drop out
             # drop controls whose last record ended > max_lag before the case onset (stale / not

@@ -62,10 +62,10 @@ def parse_args():
     return args
 
 
-def _forward_scores(model, x0, t0, x1, t1, offset_days):
+def _forward_scores(model, x0, t0, x1, t1, offset_days, termination_token=None):
     """(x1, nearest_t0, half scores) for one batch -- the frozen-history read before each target."""
     logits, _, _ = model(x0, t0)  # legacy interface
-    scores, nearest_t0 = nearest_prediction(x0, t0, logits, t1 - offset_days)
+    scores, nearest_t0 = nearest_prediction(x0, t0, logits, t1 - offset_days, termination_token=termination_token)
     return scores.half(), nearest_t0, logits
 
 
@@ -100,7 +100,7 @@ def main():
     with torch.no_grad():
         for batch_idx in tqdm(eval_iter(len(ds), args.batch_size), total=int(np.ceil(len(ds) / args.batch_size)), desc="Phase 1", leave=False):
             x0, t0, x1, t1 = (b.to(device) for b in ds.get_batch(batch_idx))
-            scores, nearest_t0, _ = _forward_scores(model, x0, t0, x1, t1, offset_days)
+            scores, nearest_t0, _ = _forward_scores(model, x0, t0, x1, t1, offset_days, termination_token=reader.death_token)
             dis_collator.step(tokens=x1, timesteps=nearest_t0, logits=scores)
     dis_rates, _ = dis_collator.finalize()  # (N, V) case scores, NaN where not a case
     del dis_collator
@@ -125,7 +125,7 @@ def main():
         covariates.append(region_codes)
     cc = ConcordanceCollator(
         dis_rates=dis_rates, case_times=case_times, last_t=last_t, covariates=covariates or None,
-        chunk_size=args.chunk_size, max_lag=args.max_lag * DAYS_PER_YEAR,
+        chunk_size=args.chunk_size, max_lag=args.max_lag * DAYS_PER_YEAR, termination_token=reader.death_token,
     )
     del dis_rates, case_times  # the collator kept its own copies
     with torch.no_grad():
