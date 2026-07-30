@@ -114,13 +114,20 @@ class HonicReader:
         """Per-participant forecast cutoff for `at` YEARS after each baseline.
 
         cutoff_age (DAYS) = (age_bl + at) * 365.25. Returns {pid: cutoff_days} for
-        participants with follow-up past the cutoff (exit age > cutoff) -- i.e.
-        someone to forecast into; others are dropped. The dict keys define the
-        forecast cohort; pass it straight to Dataset(prompt_age=...)."""
+        participants with BOTH follow-up past the cutoff (exit age > cutoff, someone
+        to forecast into) AND at least one event on/before it (earliest age <= cutoff,
+        a non-empty prompt to read a hazard from); others are dropped. Without the
+        earliest-age filter, empty-prompt pids give x0 of shape (B, 0) and forecast's
+        logits[:, -1, :] blows up. The dict keys define the forecast cohort; pass it
+        straight to Dataset(prompt_age=...).
+        # ponytail: earliest RAW token; exact while blacklist is off and no_event never
+        # precedes it. A right-crop that drops every pre-cutoff token could still empty
+        # a prompt -- switch to a transform-aware length if that ever bites."""
         pids = self._participants
         age_bl = np.array([self._age_bl_of[p] for p in pids], dtype=np.float64)
         cutoff = (age_bl + at) * DAYS_PER_YEAR  # (N,) days
-        keep = self.exit_times(pids) > cutoff
+        earliest = np.array([self.timesteps[self.start_pos[p]] for p in pids], dtype=np.float64)  # stream is age-ascending
+        keep = (self.exit_times(pids) > cutoff) & (earliest <= cutoff)
         return {p: float(c) for p, c, k in zip(pids, cutoff, keep) if k}
 
 
