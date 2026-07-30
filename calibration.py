@@ -160,8 +160,6 @@ def main():
     else:
         region_groups = [(None, np.ones(len(pids), dtype=bool))]
 
-    with np.errstate(over="ignore", invalid="ignore"):
-        prob_dis = 1.0 - np.exp(-dis_rates.astype(np.float32) * window)  # (N, V) case probabilities
     is_case = ~np.isnan(dis_rates)  # (N, V)
     age_group_keys = [
         f"{int(start / DAYS_PER_YEAR)}-{int(end / DAYS_PER_YEAR)}"
@@ -175,11 +173,9 @@ def main():
     rows = []
     for i, bracket in enumerate(tqdm(age_group_keys, desc="age bins")):
         lo, hi = age_group_edges[i], age_group_edges[i + 1]  # bin i == [lo, hi) (matches searchsorted right)
-        ctl_i = ctl_rates[:, i, :].astype(np.float32)  # (N, V) upcast one bin at a time
+        ctl_i = ctl_rates[:, i, :]  # (N, V) fp16 VIEW (basic slice, no copy)
         ctl_here = (~is_case) & ~np.isnan(ctl_i)  # (N, V)
         case_here = is_case & (dis_times >= lo) & (dis_times < hi)  # (N, V)
-        with np.errstate(over="ignore", invalid="ignore"):
-            prob_ctl_i = 1.0 - np.exp(-ctl_i * window)  # (N, V)
         for region, is_r in region_groups:
             for sex_label, is_g in [("female", is_female), ("male", ~is_female)]:
                 grp = is_g & is_r
@@ -187,7 +183,12 @@ def main():
                     token = reader.detokenizer.get(int(d), str(d))
                     cmask = ctl_here[:, d] & grp
                     kmask = case_here[:, d] & grp
-                    for prob_hi, pred, obs, count in reliability(prob_ctl_i[cmask, d], prob_dis[kmask, d]):
+                    # rate -> prob on the SELECTED rows only; never a full (N, V) float array
+                    # (that is what auc.py avoids and what was OOMing before/inside this loop).
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        p_ctl = 1.0 - np.exp(-ctl_i[cmask, d].astype(np.float32) * window)
+                        p_case = 1.0 - np.exp(-dis_rates[kmask, d].astype(np.float32) * window)
+                    for prob_hi, pred, obs, count in reliability(p_ctl, p_case):
                         row = {
                             "token": token, "sex": sex_label, "age_bin": bracket,
                             "prob_bin_hi": prob_hi, "pred": pred, "obs": obs, "count": count,
