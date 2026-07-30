@@ -289,3 +289,102 @@ def nearest_prediction(
     scores = scores.masked_fill(occurred, float("-inf"))
     scores = scores.masked_fill(invalid.unsqueeze(-1), float("nan"))
     return scores, nearest_t
+
+
+def nearest_prediction_at(
+    x0: torch.Tensor,
+    t0: torch.Tensor,
+    logits: torch.Tensor,
+    query_t: torch.Tensor,
+    tokens: torch.Tensor,
+    terminate_except=DEFAULT_TERMINATE_EXCEPT,
+):
+    """Per-(query, token) nearest_prediction: the legacy model's logit for a specific
+    token at the input step strictly before each query time -- avoids the (B, Q, V)
+    intermediate (only one token per query is needed, e.g. the concordance read).
+
+    x0, t0: (B, L0); logits: (B, L0, V); query_t: (B, Q); tokens: (Q,) or (B, Q).
+    Returns (scores (B, Q), nearest_t (B, Q)): the token's logit, -inf if already
+    occurred by that step, NaN if there is no strict-before history.
+    """
+    V = logits.shape[-1]
+    idx, nearest_t, invalid = lookup(t0, query_t)  # (B, Q)
+    B, Q = idx.shape
+    tok = torch.broadcast_to(tokens, idx.shape)
+    b = torch.arange(B, device=logits.device).unsqueeze(1).expand(B, Q)
+    scores = logits[b, idx, tok]  # (B, Q)
+    occurred = have_occurred(x0, terminate_except, V)[b, idx, tok]  # (B, Q)
+    scores = scores.masked_fill(occurred, float("-inf"))
+    scores = scores.masked_fill(invalid, float("nan"))
+    return scores, nearest_t
+
+
+class ConcordanceCollator:
+    """Dynamic-AUC (time-dependent) concordance for the legacy model. Ported from
+    delphi eval.ConcordanceCollator, using nearest_prediction_at (no intensity_at) and
+    with an optional same-region constraint.
+
+    A case event = each (participant, disease) pair the participant develops, with its
+    frozen-history score (case_scores) and onset age (case_times). For each case, over
+    every control batch, it counts at-risk same-sex (and same-region, if given) controls
+    whose model score for the case's disease AT THE CASE'S ONSET AGE is below the case's
+    score. Accumulates concordant/total pairs per case event; c-index = sum/sum.
+    """
+
+    def __init__(
+        self,
+        dis_rates: torch.Tensor,  # (N, V) case scores; NaN where not a case
+        case_times: torch.Tensor,  # (N, V) onset-age matrix (days), NaN if never
+        is_female: torch.Tensor,  # (N,) bool
+        region_codes: torch.Tensor | None = None,  # (N,) int, or None for no region constraint
+        chunk_size: int = 8192,
+        max_gap_days: float = 5 * 365.25,
+        same_sex_only: bool = True,
+    ):
+        cp, ct = (~torch.isnan(dis_rates)).nonzero(as_tuple=True)  # flatten case events
+        self.case_scores = dis_rates[cp, ct].float()
+        self.case_times_mat = case_times  # (N, V) onset matrix (for the at-risk check)
+        self.case_times = case_times[cp, ct].float()
+        self.case_tokens = ct
+        self.case_participants = cp
+        self.is_female = is_female
+        self.region_codes = region_codes
+        self.case_sex = is_female[cp].cpu().numpy()
+        self.chunk_size = chunk_size
+        self.max_gap_days = max_gap_days
+        self.same_sex_only = same_sex_only
+        E = len(cp)
+        self.concordant_pairs = np.zeros(E, dtype=np.float64)
+        self.total_pairs = np.zeros(E, dtype=np.float64)
+        self.participant_offset = 0
+        self.device = self.case_scores.device
+
+    def step(self, x0: torch.Tensor, t0: torch.Tensor, logits: torch.Tensor):
+        """Score this batch's participants as controls against every case event."""
+        B = t0.shape[0]
+        E_total = len(self.case_tokens)
+        j = torch.arange(B, device=self.device) + self.participant_offset  # control global ids
+        for s in range(0, E_total, self.chunk_size):
+            e = min(s + self.chunk_size, E_total)
+            cct = self.case_times[s:e]  # (E_c,)
+            ctok = self.case_tokens[s:e]
+            cpart = self.case_participants[s:e]
+            cscore = self.case_scores[s:e]
+            # legacy: control's rate for the case's token at the case's onset age
+            ctrl, t_at = nearest_prediction_at(x0, t0, logits, cct.unsqueeze(0).expand(B, -1), ctok)  # (B, E_c)
+            valid = t_at >= 0  # has strict-before history (not padding)
+            valid &= ~torch.isnan(ctrl)  # no history / occurred-NaN controls drop out
+            valid &= (cct.unsqueeze(0) - t_at) < self.max_gap_days  # read within max_gap of onset
+            j_onset = self.case_times_mat[j.unsqueeze(1), ctok.unsqueeze(0).expand(B, -1)]
+            valid &= j_onset.isnan() | (j_onset > cct.unsqueeze(0))  # at-risk: control has not developed it yet
+            valid &= j.unsqueeze(1) != cpart.unsqueeze(0)  # not the case itself
+            if self.same_sex_only:
+                valid &= self.is_female[j].unsqueeze(1) == self.is_female[cpart].unsqueeze(0)
+            if self.region_codes is not None:
+                valid &= self.region_codes[j].unsqueeze(1) == self.region_codes[cpart].unsqueeze(0)
+            self.concordant_pairs[s:e] += (valid & (ctrl.float() < cscore.unsqueeze(0))).sum(0).cpu().numpy()
+            self.total_pairs[s:e] += valid.sum(0).cpu().numpy()
+        self.participant_offset += B
+
+    def finalize(self):
+        return self.case_sex, self.case_tokens.cpu().numpy(), self.total_pairs, self.concordant_pairs
