@@ -351,7 +351,13 @@ class ConcordanceCollator:
         max_lag: float = 365.25,  # days (1 year)
         termination_token: int | None = None,  # death: controls read after it -> NaN -> dropped
     ):
-        cp, ct = (~torch.isnan(dis_rates)).nonzero(as_tuple=True)  # flatten case events
+        # flatten case events; chunk rows so no nonzero() call exceeds INT_MAX elements
+        mask = ~torch.isnan(dis_rates)
+        step = max(1, (2**31 - 1) // dis_rates.shape[1])
+        idx = [(r + s, c) for s in range(0, dis_rates.shape[0], step)
+               for r, c in [mask[s:s + step].nonzero(as_tuple=True)]]
+        cp = torch.cat([r for r, _ in idx])
+        ct = torch.cat([c for _, c in idx])
         self.case_scores = dis_rates[cp, ct].float()
         self.case_times_mat = case_times  # (N, V) onset matrix (for the at-risk check)
         self.case_times = case_times[cp, ct].float()
