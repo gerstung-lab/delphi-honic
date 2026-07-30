@@ -121,9 +121,9 @@ def main():
 
     gen = torch.Generator(device=device).manual_seed(args.seed)
     ctl_collator = AgeStratRatesCollator(
-        age_groups=torch.from_numpy(age_group_edges).float().to(device), generator=gen
+        age_groups=torch.from_numpy(age_group_edges).float().to(device), n_participants=len(ds), generator=gen
     )
-    dis_collator = DiseaseRatesCollator(targets=targets)
+    dis_collator = DiseaseRatesCollator(targets=targets, n_participants=len(ds))
 
     with torch.no_grad():
         for batch_idx in tqdm(
@@ -140,9 +140,13 @@ def main():
 
     ctl_rates, _ = ctl_collator.finalize()  # (N, n_bins, V) per-year rates
     dis_rates, dis_times = dis_collator.finalize()  # (N, V), (N, V)
-    ctl_rates = ctl_rates.numpy().astype(np.float32)
-    dis_rates = dis_rates.numpy().astype(np.float32)
+    # keep the big arrays float16 (as auc.py does) -- upcasting to float32 here would
+    # double a ~46GB (N, n_bins, V) array. The probability math below upcasts one
+    # (N, V) slice at a time instead, which is identical numerically but bounded.
+    ctl_rates = ctl_rates.numpy()  # float16
+    dis_rates = dis_rates.numpy()  # float16
     dis_times = dis_times.numpy()
+    del ctl_collator, dis_collator
     is_female = reader.is_female(pids)
 
     # region as an optional stratification dimension (see auc.py): a (label, mask)
@@ -154,8 +158,7 @@ def main():
         region_groups = [(None, np.ones(len(pids), dtype=bool))]
 
     with np.errstate(over="ignore", invalid="ignore"):
-        prob_dis = 1.0 - np.exp(-dis_rates * window)  # (N, V) case probabilities
-    dis_time_bin = np.searchsorted(age_group_edges, dis_times, side="right") - 1  # (N, V)
+        prob_dis = 1.0 - np.exp(-dis_rates.astype(np.float32) * window)  # (N, V) case probabilities
     is_case = ~np.isnan(dis_rates)  # (N, V)
     age_group_keys = [
         f"{int(start / DAYS_PER_YEAR)}-{int(end / DAYS_PER_YEAR)}"
@@ -168,10 +171,12 @@ def main():
     target_ids = targets.detach().cpu().numpy().tolist()
     rows = []
     for i, bracket in enumerate(tqdm(age_group_keys, desc="age bins")):
-        ctl_here = (~is_case) & ~np.isnan(ctl_rates[:, i, :])  # (N, V)
-        case_here = is_case & (dis_time_bin == i)  # (N, V)
+        lo, hi = age_group_edges[i], age_group_edges[i + 1]  # bin i == [lo, hi) (matches searchsorted right)
+        ctl_i = ctl_rates[:, i, :].astype(np.float32)  # (N, V) upcast one bin at a time
+        ctl_here = (~is_case) & ~np.isnan(ctl_i)  # (N, V)
+        case_here = is_case & (dis_times >= lo) & (dis_times < hi)  # (N, V)
         with np.errstate(over="ignore", invalid="ignore"):
-            prob_ctl_i = 1.0 - np.exp(-ctl_rates[:, i, :] * window)  # (N, V)
+            prob_ctl_i = 1.0 - np.exp(-ctl_i * window)  # (N, V)
         for region, is_r in region_groups:
             for sex_label, is_g in [("female", is_female), ("male", ~is_female)]:
                 grp = is_g & is_r
