@@ -53,7 +53,6 @@ def parse_args():
     p.add_argument("--out", required=True, help="output CSV path")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--offset", type=float, default=0.0, help="forecast offset in YEARS (score at t1 - offset)")
-    p.add_argument("--max-lag", type=float, default=1.0, help="drop reads whose (offset-adjusted) target is more than this many YEARS after the frozen read step (stale prediction -> NaN -> excluded)")
     p.add_argument("--age-start", type=int, default=40)
     p.add_argument("--age-end", type=int, default=85)
     p.add_argument("--age-gap", type=int, default=5)
@@ -174,7 +173,6 @@ def main():
     pids = ds.sort_by_length(descending=True)
 
     offset_days = args.offset * DAYS_PER_YEAR
-    max_lag_days = args.max_lag * DAYS_PER_YEAR
     gen = torch.Generator(device=device).manual_seed(args.seed)
     ctl_collator = AgeStratRatesCollator(
         age_groups=torch.from_numpy(age_group_edges).float().to(device), n_participants=len(ds), generator=gen
@@ -190,14 +188,9 @@ def main():
             x0, t0, x1, t1 = (b.to(device) for b in ds.get_batch(batch_idx))
             logits, _, _ = model(x0, t0)  # legacy interface: (logits, loss, att)
             # scores at the input step strictly before each target's (t1 - offset).
-            # termination_token: reads past death -> NaN (defensive; death is last under
-            # the default no_event config, so this only bites a negative --offset).
-            query_t = t1 - offset_days
-            scores, nearest_t0 = nearest_prediction(x0, t0, logits, query_t, termination_token=reader.death_token)
-            # max_lag: a read is stale if its (offset-adjusted) target is > max_lag after
-            # the read step -> NaN -> excluded (nearest_t0 = -1e4 where invalid, already NaN).
-            lag = query_t - nearest_t0  # (B, Q); >= 0 for valid reads
-            scores = scores.masked_fill((lag > max_lag_days).unsqueeze(-1), float("nan"))
+            # termination_token: reads past death -> NaN (death is last under the default
+            # no_event config, so this only bites a negative --offset).
+            scores, nearest_t0 = nearest_prediction(x0, t0, logits, t1 - offset_days, termination_token=reader.death_token)
             scores = scores.half()
             ctl_collator.step(timesteps=nearest_t0, logits=scores)
             dis_collator.step(tokens=x1, timesteps=nearest_t0, logits=scores)
