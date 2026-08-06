@@ -119,8 +119,11 @@ def _stratum_auc(is_case, dis_rates, dis_times, ctl_bin, g, lo, hi):
     removal: for each disease we keep only the rows that are a valid control or case in
     this group and rank JUST those -- no full-N argsort over out-of-group / NaN rows.
 
-    g: (N,) in-group bool (this region+sex). controls = in-group, not a case of the
-    disease, with a bin control rate; cases = in-group onsets in [lo, hi).
+    g: (N,) in-group bool (this region+sex). Cases and controls share ONE window: cases
+    = in-group onsets in [lo, hi); controls = in-group, at risk and event-free ACROSS
+    [lo, hi) -- either never a case, or a case whose onset is at/after hi. A later case
+    is a legitimate control here (they did not develop it in THIS window); dropping them
+    would strip the high-risk tail out of the control pool and inflate AUC.
     Returns (n_ctl, n_case, auc), each (V,). AUC = P(case score > control score), ties 0.5
     -- same statistic as batched_mann_whitney_auc.
     """
@@ -134,9 +137,12 @@ def _stratum_auc(is_case, dis_rates, dis_times, ctl_bin, g, lo, hi):
     for d in range(V):
         cd = ctl_bin[gi, d]  # (n_g,) control rate for disease d in this bin
         ic = is_case[gi, d]  # (n_g,) does this in-group participant develop d at all
-        cv = (~ic) & ~np.isnan(cd)  # controls: not a case, has a bin control rate
-        dtd = dis_times[gi, d]
+        dtd = dis_times[gi, d]  # (n_g,) onset age of d, NaN if never
         kv = ic & (dtd >= lo) & (dtd < hi)  # cases: onset in [lo, hi) (matches searchsorted right)
+        # controls: event-free across the whole window. Onset < lo is excluded too --
+        # already prevalent, no longer at risk (its ctl score is -inf from
+        # nearest_prediction's already-occurred mask, so it must not slip through).
+        cv = ~np.isnan(cd) & (~ic | (dtd >= hi))
         n1 = int(cv.sum())
         n2 = int(kv.sum())
         n_ctl[d] = n1
@@ -232,8 +238,9 @@ def main():
     else:
         region_groups = [(None, np.ones(len(pids), dtype=bool))]
 
-    # is_case[:, d] marks participants who develop disease d at all; _stratum_auc bins
-    # cases inline (dis_times in [lo, hi)) and ranks only the valid rows per column.
+    # is_case[:, d] marks participants who develop disease d at all; _stratum_auc splits
+    # them per bin by dis_times (onset in [lo, hi) = case here, onset >= hi = control
+    # here, onset < lo = prevalent, dropped) and ranks only the valid rows per column.
     is_case = ~np.isnan(dis_rates)  # (N, V)
 
     results = {}
