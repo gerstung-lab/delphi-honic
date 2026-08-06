@@ -102,6 +102,18 @@ def _cell(res, d):
     }
 
 
+def _incomplete_bins(exit_t, edges):
+    """(N, n_bins) bool: bins the participant is NOT observed all the way through.
+
+    A control is only a control if we saw them across the whole bin -- if follow-up
+    ends inside [lo, hi) their "never developed d" is censoring, not absence, and
+    onset could sit in the unseen tail. Cases need no such check (an onset in the
+    bin is observed by definition). Edge convention matches the case window
+    [lo, hi): exit == hi is complete, exit just under hi is not.
+    """
+    return np.asarray(exit_t)[:, None] < np.asarray(edges)[None, 1:]
+
+
 def _stratum_auc(is_case, dis_rates, dis_times, ctl_bin, g, lo, hi):
     """Windowed AUC for one (region, sex, age-bin) stratum, COLUMN BY COLUMN with row
     removal: for each disease we keep only the rows that are a valid control or case in
@@ -201,6 +213,11 @@ def main():
     dis_rates = dis_rates.numpy()
     dis_times = dis_times.numpy()
     del ctl_collator, dis_collator
+
+    # censor-aware controls: blank every bin the participant isn't followed through
+    # (all diseases at once). Only bites the bin containing their exit -- later bins
+    # hold no tokens, so they are already NaN.
+    ctl_rates[_incomplete_bins(reader.exit_times(pids), age_group_edges)] = np.nan
 
     is_female = reader.is_female(pids)  # (N,) bool, aligned to the array row order
 
